@@ -1,0 +1,25 @@
+{
+  "id": "tsl",
+  "label": "TSL",
+  "nav_tab": "protocoles",
+  "tab_group": "protocoles",
+  "tab_order": 2,
+  "tab_template": "tsl/settings_tab.html",
+  "settings_keys": {
+    "tsl_enabled": {
+      "type": "bool",
+      "default": false
+    },
+    "tsl_port": {
+      "type": "int",
+      "default": 12345
+    },
+    "tsl_mapping": {
+      "type": "json",
+      "default": []
+    }
+  },
+  "version": "0.1.0",
+  "order": 4,
+  "description": "Provider TSL UMD — diffuse les informations de tally et UMD (Under Monitor Display) aux moniteurs compatibles TSL via le protocole UDP TSL 3.1/5.0."
+}

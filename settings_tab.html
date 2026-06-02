@@ -1,0 +1,191 @@
+<div id="protocoles-tab-tsl" class="set-tab-content" style="display:none">
+    <h2>Service TSL 5.0</h2>
+    <div class="form">
+        <div class="row">
+            <div class="field" style="align-self:center"><label style="display:flex; align-items:center; gap:var(--space-2)">
+                <input type="checkbox" class="ios-toggle" id="s_tsl_enabled">
+                Activer le service TSL
+            </label></div>
+            <div class="field"><label>Port TCP</label>
+                <input type="number" id="s_tsl_port" min="1" max="65535" value="12345"></div>
+            <button class="btn btn-green" onclick="appliquerTsl()">Appliquer</button>
+        </div>
+        <div class="meta" style="margin-top:var(--space-2)">
+            L'orchestrateur écoute les paquets <strong>TSL 5.0</strong> sur ce port TCP depuis VSM ou
+            tout contrôleur compatible. Les tallies sont distribués à chaque container multiview
+            configuré ci-dessous via HTTP. Le multiview doit avoir l'option
+            <em>« TSL géré par l'orchestrateur »</em> activée dans sa configuration de déploiement.
+        </div>
+    </div>
+
+    <h2>État</h2>
+    <div class="form">
+        <div class="row">
+            <div class="field"><label>Statut</label>
+                <div id="tsl_status_badge" class="meta">—</div></div>
+            <div class="field"><label>Port effectif</label>
+                <div id="tsl_status_port" class="meta">—</div></div>
+            <div class="field"><label>Clients connectés</label>
+                <div id="tsl_status_clients" class="meta">—</div></div>
+            <div class="field"><label>Dernier paquet</label>
+                <div id="tsl_status_last_pkt" class="meta">—</div></div>
+            <div class="field"><label>Démarré depuis</label>
+                <div id="tsl_status_uptime" class="meta">—</div></div>
+        </div>
+        <div id="tsl_status_error" class="meta" style="margin-top:var(--space-2); color:var(--status-stopped-fg)"></div>
+    </div>
+
+    <h2>État tally courant</h2>
+    <div class="form">
+        <div id="tsl_tally_state" class="meta">—</div>
+    </div>
+
+    <h2>Mapping TSL → Multiviews</h2>
+    <div class="form">
+        <div class="meta" style="margin-bottom:var(--space-3)">
+            Associer chaque index TSL (numéro de source dans VSM) au flux vidéo du container
+            multiview correspondant. Un même index peut alimenter plusieurs multiviews.
+        </div>
+        <table id="tsl_mapping_table" style="width:100%; border-collapse:collapse; font-size:0.84em; margin-bottom:var(--space-3)">
+            <thead>
+                <tr style="color:var(--text-muted); text-align:left; border-bottom:1px solid var(--border)">
+                    <th style="padding:var(--space-1) var(--space-2)">Index TSL</th>
+                    <th style="padding:var(--space-1) var(--space-2)">Container multiview</th>
+                    <th style="padding:var(--space-1) var(--space-2)">Flux #</th>
+                    <th style="padding:var(--space-1) var(--space-2)"></th>
+                </tr>
+            </thead>
+            <tbody id="tsl_mapping_tbody">
+                <tr><td colspan="4" class="meta" style="padding:var(--space-1) var(--space-2)">—</td></tr>
+            </tbody>
+        </table>
+        <div style="display:flex; gap:var(--space-3)">
+            <button class="btn" onclick="tslAddRow()">+ Ajouter une ligne</button>
+            <button class="btn btn-green" onclick="sauvegarderTslMapping()">Enregistrer</button>
+        </div>
+    </div>
+</div>
+
+<script>
+// ─── TSL ─────────────────────────────────────────────────────────────────────
+let _tslMapping   = [];
+let _tslMultiviews = [];   // [{vmid, hostname, flux_count}]
+
+async function rafraichirTsl() {
+    try {
+        const r = await fetch('/api/tsl/status');
+        if (!r.ok) return;
+        const s = await r.json();
+        document.getElementById('s_tsl_enabled').checked = !!s.enabled_setting;
+        document.getElementById('s_tsl_port').value      = s.port_setting || 12345;
+        const badge = document.getElementById('tsl_status_badge');
+        badge.textContent = s.running ? 'Actif' : (s.error ? 'Erreur' : 'Inactif');
+        badge.style.color = s.running ? 'var(--status-running-fg)' : (s.error ? 'var(--status-error-fg)' : 'var(--text-muted)');
+        document.getElementById('tsl_status_port').textContent    = s.port    || '—';
+        document.getElementById('tsl_status_clients').textContent = s.clients ?? 0;
+        document.getElementById('tsl_status_uptime').textContent  = s.uptime  || '—';
+        document.getElementById('tsl_status_error').textContent   = s.error   || '';
+        const ago = s.last_pkt_ago_s;
+        document.getElementById('tsl_status_last_pkt').textContent =
+            ago === null ? '—' : (ago < 5 ? `il y a ${ago}s` : `il y a ${Math.round(ago)}s`);
+
+        // État tally
+        const tally = s.tally || {};
+        const keys = Object.keys(tally);
+        if (keys.length) {
+            const COLORS = { red: '#cc2222', green: '#22aa44', amber: '#cc8800', off: 'var(--text-muted)' };
+            document.getElementById('tsl_tally_state').innerHTML = keys.sort((a,b) => a-b).map(idx => {
+                const c = tally[idx];
+                return `<span style="display:inline-flex;align-items:center;gap:4px;margin-right:12px">
+                    <span style="width:10px;height:10px;border-radius:50%;background:${COLORS[c]||'#444'}"></span>
+                    <span>IDX ${idx} → <strong>${c}</strong></span>
+                </span>`;
+            }).join('');
+        } else {
+            document.getElementById('tsl_tally_state').textContent = 'Aucun tally actif';
+        }
+    } catch(e) {}
+
+    // Charger les multiviews disponibles
+    try {
+        const r = await fetch('/api/home/summary');
+        if (r.ok) {
+            const data = await r.json();
+            _tslMultiviews = (data.topology?.nodes || [])
+                .filter(c => c.kind === 'multiview')
+                .map(c => ({ vmid: c.vmid, hostname: c.hostname, flux_count: (c.consumes || []).length }));
+        }
+    } catch(e) {}
+
+    // Charger le mapping
+    try {
+        const r = await fetch('/api/tsl/mapping');
+        if (r.ok) _tslMapping = await r.json();
+    } catch(e) {}
+    _tslRenderMapping();
+}
+
+function _tslMultiviewOptions(selectedVmid) {
+    return '<option value="">— choisir —</option>' +
+        _tslMultiviews.map(mv =>
+            `<option value="${mv.vmid}"${String(mv.vmid) === String(selectedVmid) ? ' selected' : ''}>${mv.hostname}</option>`
+        ).join('');
+}
+
+function _tslRenderMapping() {
+    const tbody = document.getElementById('tsl_mapping_tbody');
+    if (!_tslMapping.length) {
+        tbody.innerHTML = '<tr><td colspan="4" class="meta" style="padding:var(--space-1) var(--space-2)">Aucune entrée. Cliquez « + Ajouter ».</td></tr>';
+        return;
+    }
+    tbody.innerHTML = _tslMapping.map((row, i) => `
+        <tr style="border-bottom:1px solid var(--border)">
+            <td style="padding:var(--space-1) var(--space-2)">
+                <input type="number" id="tsl_idx_${i}" value="${row.tsl_index ?? ''}" min="0" style="width:70px">
+            </td>
+            <td style="padding:var(--space-1) var(--space-2)">
+                <select id="tsl_vmid_${i}">${_tslMultiviewOptions(row.vmid)}</select>
+            </td>
+            <td style="padding:var(--space-1) var(--space-2)">
+                <input type="number" id="tsl_flux_${i}" value="${row.flux_idx ?? 0}" min="0" style="width:60px">
+            </td>
+            <td style="padding:var(--space-1) var(--space-2)">
+                <button class="btn" style="padding:2px 8px;font-size:0.8em" onclick="tslRemoveRow(${i})">✕</button>
+            </td>
+        </tr>
+    `).join('');
+}
+
+function tslAddRow() {
+    _tslMapping.push({ tsl_index: '', vmid: '', flux_idx: 0 });
+    _tslRenderMapping();
+}
+
+function tslRemoveRow(i) {
+    _tslMapping.splice(i, 1);
+    _tslRenderMapping();
+}
+
+async function sauvegarderTslMapping() {
+    const rows = [];
+    for (let i = 0; i < _tslMapping.length; i++) {
+        const tsl_index = parseInt(document.getElementById('tsl_idx_'  + i)?.value);
+        const vmid      = parseInt(document.getElementById('tsl_vmid_' + i)?.value);
+        const flux_idx  = parseInt(document.getElementById('tsl_flux_' + i)?.value || '0');
+        if (isNaN(tsl_index) || isNaN(vmid)) continue;
+        rows.push({ tsl_index, vmid, flux_idx });
+    }
+    const r = await fetch('/api/tsl/mapping', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(rows) });
+    if (r.ok) { mxlToast('Mapping TSL enregistré', 'success'); _tslMapping = rows; }
+    else       { mxlToast('Erreur enregistrement mapping TSL', 'error'); }
+}
+
+async function appliquerTsl() {
+    const enabled = document.getElementById('s_tsl_enabled').checked;
+    const port    = parseInt(document.getElementById('s_tsl_port').value) || 12345;
+    const r = await fetch('/api/tsl/apply', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ enabled, port }) });
+    const j = await r.json();
+    if (r.ok) { mxlToast('Service TSL appliqué', 'success'); rafraichirTsl(); }
+    else       { mxlToast('Erreur : ' + (j.error || 'HTTP ' + r.status), 'error'); }
+}
+</script>
