@@ -506,6 +506,25 @@ def register_routes(bp):
     def tsl_sources_by_shm():
         return jsonify(db_get_source_labels_by_shm())
 
+    # ── Suffix map (héritage parent → label auto) ─────────────────────────────
+
+    _DEFAULT_SUFFIX_MAP = {"_audio_0": "_A1", "_audio_1": "_A2", "_anc_0": "_Anc"}
+
+    @bp.route("/api/source_labels/suffix_map", methods=["GET"])
+    @require_login
+    def source_labels_suffix_map_get():
+        stored = db_get_setting("source_label_suffix_map", None)
+        return jsonify(stored if isinstance(stored, dict) else _DEFAULT_SUFFIX_MAP)
+
+    @bp.route("/api/source_labels/suffix_map", methods=["POST"])
+    @require_perm("settings.edit")
+    def source_labels_suffix_map_set():
+        data = request.json
+        if not isinstance(data, dict):
+            return jsonify({"error": "dict attendu"}), 400
+        db_set_setting("source_label_suffix_map", {str(k): str(v) for k, v in data.items()})
+        return jsonify({"ok": True})
+
     # ── Mapping par connexion ─────────────────────────────────────────────────
 
     @bp.route("/api/tsl/mapping/<int:cid>", methods=["GET"])
