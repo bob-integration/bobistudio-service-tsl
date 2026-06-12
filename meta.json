@@ -1,9 +1,16 @@
 {
-  "version": "0.1.0",
-  "published_at": "2026-06-01",
+  "version": "0.2.0",
+  "published_at": "2026-06-12",
   "changes": {
     "Nouveautés": [
-      "Version initiale"
+      "Multi-connexions TSL : plusieurs serveurs TCP simultanés, chacun avec son port, sa colonne label et sa base tally",
+      "10 niveaux tally par index (1 niveau = 1 bit natif LH/RH/TT d'une connexion TSL)",
+      "10 colonnes labels par source (col 0=hostname auto, col 1=MXL auto, cols 2-9 éditables)",
+      "Noms de colonnes renommables globalement",
+      "Mapping tally/label per-fenêtre multiview (label_col, tally_l_level, tally_r_level)",
+      "Distribution label texte vers les multiviews via /tally_bulk (champ text)",
+      "Page Câbles : sélecteur de colonne label TSL global (localStorage)",
+      "Migration automatique de l'ancienne config tsl_enabled/tsl_port vers tsl_connections"
     ],
     "Corrections": [],
     "Bugs connus": []

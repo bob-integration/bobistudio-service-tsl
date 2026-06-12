@@ -1,191 +1,217 @@
 <div id="protocoles-tab-tsl" class="set-tab-content" style="display:none">
-    <h2>Service TSL 5.0</h2>
+
+    <!-- ─── Connexions ─────────────────────────────────────────────────────── -->
+    <h2>Connexions TSL 5.0</h2>
     <div class="form">
-        <div class="row">
-            <div class="field" style="align-self:center"><label style="display:flex; align-items:center; gap:var(--space-2)">
-                <input type="checkbox" class="ios-toggle" id="s_tsl_enabled">
-                Activer le service TSL
-            </label></div>
-            <div class="field"><label>Port TCP</label>
-                <input type="number" id="s_tsl_port" min="1" max="65535" value="12345"></div>
-            <button class="btn btn-green" onclick="appliquerTsl()">Appliquer</button>
+        <div class="meta" style="margin-bottom:var(--space-3)">
+            Chaque connexion ouvre un serveur TCP sur son port. Le champ <em>Texte TSL</em> reçu
+            automatiquement met à jour la colonne label désignée. Les niveaux tally LH/RH/TT de
+            cette connexion sont affectés aux niveaux globaux à partir de <em>Tally base</em>.
         </div>
-        <div class="meta" style="margin-top:var(--space-2)">
-            L'orchestrateur écoute les paquets <strong>TSL 5.0</strong> sur ce port TCP depuis VSM ou
-            tout contrôleur compatible. Les tallies sont distribués à chaque container multiview
-            configuré ci-dessous via HTTP. Le multiview doit avoir l'option
-            <em>« TSL géré par l'orchestrateur »</em> activée dans sa configuration de déploiement.
+        <table id="tsl_conn_table" style="width:100%;border-collapse:collapse;font-size:0.84em;margin-bottom:var(--space-3)">
+            <thead>
+                <tr style="color:var(--text-muted);text-align:left;border-bottom:1px solid var(--border)">
+                    <th style="padding:var(--space-1) var(--space-2)">Nom</th>
+                    <th style="padding:var(--space-1) var(--space-2)">Port TCP</th>
+                    <th style="padding:var(--space-1) var(--space-2)">Actif</th>
+                    <th style="padding:var(--space-1) var(--space-2)">Colonne label</th>
+                    <th style="padding:var(--space-1) var(--space-2)">Tally base</th>
+                    <th style="padding:var(--space-1) var(--space-2)">Statut</th>
+                    <th style="padding:var(--space-1) var(--space-2)"></th>
+                </tr>
+            </thead>
+            <tbody id="tsl_conn_tbody">
+                <tr><td colspan="7" class="meta" style="padding:var(--space-1) var(--space-2)">—</td></tr>
+            </tbody>
+        </table>
+        <div style="display:flex;gap:var(--space-3)">
+            <button class="btn" onclick="tslConnAdd()">+ Ajouter une connexion</button>
         </div>
     </div>
 
-    <h2>État</h2>
+    <!-- ─── Noms des colonnes ──────────────────────────────────────────────── -->
+    <h2>Noms des colonnes labels</h2>
     <div class="form">
-        <div class="row">
-            <div class="field"><label>Statut</label>
-                <div id="tsl_status_badge" class="meta">—</div></div>
-            <div class="field"><label>Port effectif</label>
-                <div id="tsl_status_port" class="meta">—</div></div>
-            <div class="field"><label>Clients connectés</label>
-                <div id="tsl_status_clients" class="meta">—</div></div>
-            <div class="field"><label>Dernier paquet</label>
-                <div id="tsl_status_last_pkt" class="meta">—</div></div>
-            <div class="field"><label>Démarré depuis</label>
-                <div id="tsl_status_uptime" class="meta">—</div></div>
+        <div class="meta" style="margin-bottom:var(--space-3)">
+            Colonnes 0 et 1 sont automatiques (Hostname et MXL depuis la source liée).
+            Les colonnes 2-9 sont librement renommables et modifiables.
         </div>
-        <div id="tsl_status_error" class="meta" style="margin-top:var(--space-2); color:var(--status-stopped-fg)"></div>
+        <div id="tsl_label_names_grid" style="display:grid;grid-template-columns:repeat(5,1fr);gap:var(--space-2);margin-bottom:var(--space-3)"></div>
+        <button class="btn btn-green" onclick="tslSaveLabelNames()">Enregistrer les noms</button>
     </div>
 
+    <!-- ─── Sources ────────────────────────────────────────────────────────── -->
+    <h2>Sources TSL</h2>
+    <div class="form">
+        <div class="meta" style="margin-bottom:var(--space-3)">
+            Gestion avancée des sources : 100 index pré-initialisés, tri par colonne, filtres,
+            sélection multi-cellules et auto-incrément (style tableur).
+        </div>
+        <div style="display:flex;align-items:center;gap:var(--space-3)">
+            <a href="/tsl/sources" class="btn btn-blue">Ouvrir l'éditeur de sources →</a>
+            <span id="tsl_src_summary" class="meta">—</span>
+        </div>
+    </div>
+
+    <!-- ─── État tally ─────────────────────────────────────────────────────── -->
     <h2>État tally courant</h2>
     <div class="form">
         <div id="tsl_tally_state" class="meta">—</div>
     </div>
 
-    <h2>Mapping TSL → Multiviews</h2>
-    <div class="form">
-        <div class="meta" style="margin-bottom:var(--space-3)">
-            Associer chaque index TSL (numéro de source dans VSM) au flux vidéo du container
-            multiview correspondant. Un même index peut alimenter plusieurs multiviews.
-        </div>
-        <table id="tsl_mapping_table" style="width:100%; border-collapse:collapse; font-size:0.84em; margin-bottom:var(--space-3)">
-            <thead>
-                <tr style="color:var(--text-muted); text-align:left; border-bottom:1px solid var(--border)">
-                    <th style="padding:var(--space-1) var(--space-2)">Index TSL</th>
-                    <th style="padding:var(--space-1) var(--space-2)">Container multiview</th>
-                    <th style="padding:var(--space-1) var(--space-2)">Flux #</th>
-                    <th style="padding:var(--space-1) var(--space-2)"></th>
-                </tr>
-            </thead>
-            <tbody id="tsl_mapping_tbody">
-                <tr><td colspan="4" class="meta" style="padding:var(--space-1) var(--space-2)">—</td></tr>
-            </tbody>
-        </table>
-        <div style="display:flex; gap:var(--space-3)">
-            <button class="btn" onclick="tslAddRow()">+ Ajouter une ligne</button>
-            <button class="btn btn-green" onclick="sauvegarderTslMapping()">Enregistrer</button>
-        </div>
-    </div>
 </div>
 
 <script>
-// ─── TSL ─────────────────────────────────────────────────────────────────────
-let _tslMapping   = [];
-let _tslMultiviews = [];   // [{vmid, hostname, flux_count}]
+// ─── TSL centralisé ─────────────────────────────────────────────────────────
+let _tslConns       = [];
+let _tslLabelNames  = [];
+let _tslSources     = [];
 
+// ── Helpers ──────────────────────────────────────────────────────────────────
 async function rafraichirTsl() {
     try {
-        const r = await fetch('/api/tsl/status');
-        if (!r.ok) return;
-        const s = await r.json();
-        document.getElementById('s_tsl_enabled').checked = !!s.enabled_setting;
-        document.getElementById('s_tsl_port').value      = s.port_setting || 12345;
-        const badge = document.getElementById('tsl_status_badge');
-        badge.textContent = s.running ? 'Actif' : (s.error ? 'Erreur' : 'Inactif');
-        badge.style.color = s.running ? 'var(--status-running-fg)' : (s.error ? 'var(--status-error-fg)' : 'var(--text-muted)');
-        document.getElementById('tsl_status_port').textContent    = s.port    || '—';
-        document.getElementById('tsl_status_clients').textContent = s.clients ?? 0;
-        document.getElementById('tsl_status_uptime').textContent  = s.uptime  || '—';
-        document.getElementById('tsl_status_error').textContent   = s.error   || '';
-        const ago = s.last_pkt_ago_s;
-        document.getElementById('tsl_status_last_pkt').textContent =
-            ago === null ? '—' : (ago < 5 ? `il y a ${ago}s` : `il y a ${Math.round(ago)}s`);
-
-        // État tally
-        const tally = s.tally || {};
-        const keys = Object.keys(tally);
-        if (keys.length) {
-            const COLORS = { red: '#cc2222', green: '#22aa44', amber: '#cc8800', off: 'var(--text-muted)' };
-            document.getElementById('tsl_tally_state').innerHTML = keys.sort((a,b) => a-b).map(idx => {
-                const c = tally[idx];
-                return `<span style="display:inline-flex;align-items:center;gap:4px;margin-right:12px">
-                    <span style="width:10px;height:10px;border-radius:50%;background:${COLORS[c]||'#444'}"></span>
-                    <span>IDX ${idx} → <strong>${c}</strong></span>
-                </span>`;
-            }).join('');
-        } else {
-            document.getElementById('tsl_tally_state').textContent = 'Aucun tally actif';
+        const [rc, rl, rs, rstate] = await Promise.all([
+            fetch('/api/tsl/connections'),
+            fetch('/api/tsl/label_names'),
+            fetch('/api/tsl/sources'),
+            fetch('/api/tsl/state'),
+        ]);
+        if (rc.ok)     _tslConns      = await rc.json();
+        if (rl.ok)     _tslLabelNames = await rl.json();
+        if (rs.ok)     _tslSources    = await rs.json();
+        _tslRenderConns();
+        _tslRenderLabelNames();
+        _tslRenderSrcSummary();
+        if (rstate.ok) {
+            const state = await rstate.json();
+            _tslRenderTallyState(state);
         }
-    } catch(e) {}
-
-    // Charger les multiviews disponibles
-    try {
-        const r = await fetch('/api/home/summary');
-        if (r.ok) {
-            const data = await r.json();
-            _tslMultiviews = (data.topology?.nodes || [])
-                .filter(c => c.kind === 'multiview')
-                .map(c => ({ vmid: c.vmid, hostname: c.hostname, flux_count: (c.consumes || []).length }));
-        }
-    } catch(e) {}
-
-    // Charger le mapping
-    try {
-        const r = await fetch('/api/tsl/mapping');
-        if (r.ok) _tslMapping = await r.json();
-    } catch(e) {}
-    _tslRenderMapping();
+    } catch(e) { console.warn('TSL rafraichir:', e); }
 }
 
-function _tslMultiviewOptions(selectedVmid) {
-    return '<option value="">— choisir —</option>' +
-        _tslMultiviews.map(mv =>
-            `<option value="${mv.vmid}"${String(mv.vmid) === String(selectedVmid) ? ' selected' : ''}>${mv.hostname}</option>`
-        ).join('');
+function _tslRenderSrcSummary() {
+    const el = document.getElementById('tsl_src_summary');
+    if (!el) return;
+    const n = _tslSources.length;
+    el.textContent = n ? `${n} source${n > 1 ? 's' : ''} enregistrée${n > 1 ? 's' : ''}` : 'Aucune source enregistrée';
 }
 
-function _tslRenderMapping() {
-    const tbody = document.getElementById('tsl_mapping_tbody');
-    if (!_tslMapping.length) {
-        tbody.innerHTML = '<tr><td colspan="4" class="meta" style="padding:var(--space-1) var(--space-2)">Aucune entrée. Cliquez « + Ajouter ».</td></tr>';
+// ── Connexions ──────────────────────────────────────────────────────────────
+function _tslRenderConns() {
+    const tbody = document.getElementById('tsl_conn_tbody');
+    if (!tbody) return;
+    if (!_tslConns.length) {
+        tbody.innerHTML = '<tr><td colspan="7" class="meta" style="padding:var(--space-1) var(--space-2)">Aucune connexion. Cliquez « + Ajouter ».</td></tr>';
         return;
     }
-    tbody.innerHTML = _tslMapping.map((row, i) => `
-        <tr style="border-bottom:1px solid var(--border)">
+    const COLORS = { red: '#cc2222', green: '#22aa44', amber: '#cc8800', off: 'var(--text-muted)' };
+    tbody.innerHTML = _tslConns.map(c => {
+        const st = c.status || {};
+        const statusTxt = st.running ? `<span style="color:var(--status-running-fg)">Actif</span> · ${st.clients ?? 0} client(s)${st.uptime ? ' · ' + st.uptime : ''}`
+                        : (st.error  ? `<span style="color:var(--status-stopped-fg)">${escapeHtml(st.error)}</span>`
+                                     : `<span style="color:var(--text-muted)">Inactif</span>`);
+        const colLabel = _tslLabelNames[c.label_col] || `Col ${c.label_col}`;
+        return `<tr style="border-bottom:1px solid var(--border)" data-cid="${c.id}">
+            <td style="padding:var(--space-1) var(--space-2)"><input type="text" class="tsl-c-name" value="${escapeHtml(c.name)}" style="width:140px"></td>
+            <td style="padding:var(--space-1) var(--space-2)"><input type="number" class="tsl-c-port" value="${c.port}" min="1" max="65535" style="width:80px"></td>
+            <td style="padding:var(--space-1) var(--space-2)"><input type="checkbox" class="ios-toggle tsl-c-enabled" ${c.enabled ? 'checked' : ''}></td>
             <td style="padding:var(--space-1) var(--space-2)">
-                <input type="number" id="tsl_idx_${i}" value="${row.tsl_index ?? ''}" min="0" style="width:70px">
+                <select class="tsl-c-label-col">
+                    ${_tslLabelNames.map((n, i) => `<option value="${i}" ${i === c.label_col ? 'selected' : ''}>${i} — ${escapeHtml(n)}</option>`).join('')}
+                </select>
             </td>
             <td style="padding:var(--space-1) var(--space-2)">
-                <select id="tsl_vmid_${i}">${_tslMultiviewOptions(row.vmid)}</select>
+                <select class="tsl-c-tally-base">
+                    ${[0,3,6,9].map(b => `<option value="${b}" ${b === c.tally_base ? 'selected' : ''}>Niv. ${b}–${b+2}</option>`).join('')}
+                </select>
             </td>
+            <td style="padding:var(--space-1) var(--space-2);font-size:0.8em">${statusTxt}</td>
             <td style="padding:var(--space-1) var(--space-2)">
-                <input type="number" id="tsl_flux_${i}" value="${row.flux_idx ?? 0}" min="0" style="width:60px">
+                <button class="btn btn-green" style="padding:2px 8px;font-size:0.8em" onclick="tslConnSave(${c.id})">Enreg.</button>
+                <button class="btn btn-red"   style="padding:2px 8px;font-size:0.8em;margin-left:4px" onclick="tslConnDel(${c.id})">✕</button>
             </td>
-            <td style="padding:var(--space-1) var(--space-2)">
-                <button class="btn" style="padding:2px 8px;font-size:0.8em" onclick="tslRemoveRow(${i})">✕</button>
-            </td>
-        </tr>
-    `).join('');
+        </tr>`;
+    }).join('');
 }
 
-function tslAddRow() {
-    _tslMapping.push({ tsl_index: '', vmid: '', flux_idx: 0 });
-    _tslRenderMapping();
+function tslConnAdd() {
+    _tslConns.push({ id: null, name: 'Nouvelle connexion', port: 12345, enabled: 0, label_col: 2, tally_base: 0, status: {} });
+    _tslRenderConns();
 }
 
-function tslRemoveRow(i) {
-    _tslMapping.splice(i, 1);
-    _tslRenderMapping();
+async function tslConnSave(cid) {
+    const row = document.querySelector(`[data-cid="${cid}"]`) ||
+                document.querySelector('[data-cid="null"]');
+    if (!row) return;
+    const data = {
+        id:         cid || null,
+        name:       row.querySelector('.tsl-c-name').value,
+        port:       parseInt(row.querySelector('.tsl-c-port').value) || 12345,
+        enabled:    row.querySelector('.tsl-c-enabled').checked ? 1 : 0,
+        label_col:  parseInt(row.querySelector('.tsl-c-label-col').value) || 2,
+        tally_base: parseInt(row.querySelector('.tsl-c-tally-base').value) || 0,
+    };
+    const url    = cid ? `/api/tsl/connections/${cid}` : '/api/tsl/connections';
+    const method = cid ? 'PUT' : 'POST';
+    const r = await fetch(url, { method, headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) });
+    if (r.ok) { mxlToast('Connexion enregistrée', 'success'); await rafraichirTsl(); }
+    else       { mxlToast('Erreur sauvegarde connexion', 'error'); }
 }
 
-async function sauvegarderTslMapping() {
-    const rows = [];
-    for (let i = 0; i < _tslMapping.length; i++) {
-        const tsl_index = parseInt(document.getElementById('tsl_idx_'  + i)?.value);
-        const vmid      = parseInt(document.getElementById('tsl_vmid_' + i)?.value);
-        const flux_idx  = parseInt(document.getElementById('tsl_flux_' + i)?.value || '0');
-        if (isNaN(tsl_index) || isNaN(vmid)) continue;
-        rows.push({ tsl_index, vmid, flux_idx });
+async function tslConnDel(cid) {
+    if (!confirm('Supprimer cette connexion TSL ?')) return;
+    const r = await fetch(`/api/tsl/connections/${cid}`, { method: 'DELETE' });
+    if (r.ok) { mxlToast('Connexion supprimée', 'success'); await rafraichirTsl(); }
+    else       { mxlToast('Erreur suppression', 'error'); }
+}
+
+// ── Noms de colonnes ──────────────────────────────────────────────────────────
+function _tslRenderLabelNames() {
+    const grid = document.getElementById('tsl_label_names_grid');
+    if (!grid) return;
+    const names = _tslLabelNames.length === 10 ? _tslLabelNames
+                : ["Hostname","MXL","Label 2","Label 3","Label 4","Label 5","Label 6","Label 7","Label 8","Label 9"];
+    grid.innerHTML = names.map((n, i) => `
+        <div class="field">
+            <label>Col ${i}${i < 2 ? ' (auto)' : ''}</label>
+            <input type="text" id="tsl_lname_${i}" value="${escapeHtml(n)}" ${i < 2 ? 'style="opacity:0.5"' : ''}>
+        </div>`).join('');
+}
+
+async function tslSaveLabelNames() {
+    const names = Array.from({length: 10}, (_, i) => document.getElementById(`tsl_lname_${i}`)?.value || `Label ${i}`);
+    const r = await fetch('/api/tsl/label_names', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(names) });
+    if (r.ok) { mxlToast('Noms enregistrés', 'success'); _tslLabelNames = names; _tslRenderConns(); }
+    else       { mxlToast('Erreur sauvegarde', 'error'); }
+}
+
+// ── État tally ────────────────────────────────────────────────────────────────
+function _tslRenderTallyState(state) {
+    const el = document.getElementById('tsl_tally_state');
+    if (!el) return;
+    const keys = Object.keys(state || {});
+    if (!keys.length) { el.textContent = 'Aucun tally actif'; return; }
+    const COLORS = { red: '#cc2222', green: '#22aa44', amber: '#cc8800', off: 'var(--text-muted)' };
+    const byIdx = {};
+    for (const k of keys) {
+        const [idx, lvl] = k.split('_').map(Number);
+        if (!byIdx[idx]) byIdx[idx] = {};
+        byIdx[idx][lvl] = state[k];
     }
-    const r = await fetch('/api/tsl/mapping', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(rows) });
-    if (r.ok) { mxlToast('Mapping TSL enregistré', 'success'); _tslMapping = rows; }
-    else       { mxlToast('Erreur enregistrement mapping TSL', 'error'); }
+    el.innerHTML = Object.keys(byIdx).sort((a,b)=>a-b).map(idx => {
+        const lvls = byIdx[idx];
+        const lvlBadges = Object.keys(lvls).sort((a,b)=>a-b).map(lvl => {
+            const c = lvls[lvl];
+            const n = _tslLabelNames[lvl] || `Niv.${lvl}`;
+            return `<span style="display:inline-flex;align-items:center;gap:3px;margin-right:8px;font-size:0.82em">
+                <span style="width:8px;height:8px;border-radius:50%;background:${COLORS[c]||'#444'}"></span>${n}: <strong>${c}</strong>
+            </span>`;
+        }).join('');
+        return `<div style="margin-bottom:var(--space-1)"><strong>IDX ${idx}</strong> — ${lvlBadges}</div>`;
+    }).join('');
 }
 
-async function appliquerTsl() {
-    const enabled = document.getElementById('s_tsl_enabled').checked;
-    const port    = parseInt(document.getElementById('s_tsl_port').value) || 12345;
-    const r = await fetch('/api/tsl/apply', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ enabled, port }) });
-    const j = await r.json();
-    if (r.ok) { mxlToast('Service TSL appliqué', 'success'); rafraichirTsl(); }
-    else       { mxlToast('Erreur : ' + (j.error || 'HTTP ' + r.status), 'error'); }
+function escapeHtml(s) {
+    return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 </script>

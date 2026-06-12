@@ -6,20 +6,12 @@
   "tab_order": 2,
   "tab_template": "tsl/settings_tab.html",
   "settings_keys": {
-    "tsl_enabled": {
-      "type": "bool",
-      "default": false
-    },
-    "tsl_port": {
-      "type": "int",
-      "default": 12345
-    },
-    "tsl_mapping": {
+    "tsl_label_names": {
       "type": "json",
-      "default": []
+      "default": ["Hostname", "MXL", "Label 2", "Label 3", "Label 4", "Label 5", "Label 6", "Label 7", "Label 8", "Label 9"]
     }
   },
-  "version": "0.1.0",
+  "version": "0.2.0",
   "order": 4,
-  "description": "Provider TSL UMD — diffuse les informations de tally et UMD (Under Monitor Display) aux moniteurs compatibles TSL via le protocole UDP TSL 3.1/5.0."
+  "description": "Service TSL 5.0 centralisé — multi-connexions, 10 niveaux tally (LH/RH/TT par connexion), 10 colonnes labels par source. Distribution automatique vers les multiviews."
 }
