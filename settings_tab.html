@@ -29,17 +29,6 @@
         </div>
     </div>
 
-    <!-- ─── Noms des colonnes ──────────────────────────────────────────────── -->
-    <h2>Noms des colonnes labels</h2>
-    <div class="form">
-        <div class="meta" style="margin-bottom:var(--space-3)">
-            Colonnes 0 et 1 sont automatiques (Hostname et MXL depuis la source liée).
-            Les colonnes 2-9 sont librement renommables et modifiables.
-        </div>
-        <div id="tsl_label_names_grid" style="display:grid;grid-template-columns:repeat(5,1fr);gap:var(--space-2);margin-bottom:var(--space-3)"></div>
-        <button class="btn btn-green" onclick="tslSaveLabelNames()">Enregistrer les noms</button>
-    </div>
-
     <!-- ─── Sources ────────────────────────────────────────────────────────── -->
     <h2>Sources TSL</h2>
     <div class="form">
@@ -80,7 +69,6 @@ async function rafraichirTsl() {
         if (rl.ok)     _tslLabelNames = await rl.json();
         if (rs.ok)     _tslSources    = await rs.json();
         _tslRenderConns();
-        _tslRenderLabelNames();
         _tslRenderSrcSummary();
         if (rstate.ok) {
             const state = await rstate.json();
@@ -163,26 +151,6 @@ async function tslConnDel(cid) {
     const r = await fetch(`/api/tsl/connections/${cid}`, { method: 'DELETE' });
     if (r.ok) { mxlToast('Connexion supprimée', 'success'); await rafraichirTsl(); }
     else       { mxlToast('Erreur suppression', 'error'); }
-}
-
-// ── Noms de colonnes ──────────────────────────────────────────────────────────
-function _tslRenderLabelNames() {
-    const grid = document.getElementById('tsl_label_names_grid');
-    if (!grid) return;
-    const names = _tslLabelNames.length === 10 ? _tslLabelNames
-                : ["Hostname","MXL","Label 2","Label 3","Label 4","Label 5","Label 6","Label 7","Label 8","Label 9"];
-    grid.innerHTML = names.map((n, i) => `
-        <div class="field">
-            <label>Col ${i}${i < 2 ? ' (auto)' : ''}</label>
-            <input type="text" id="tsl_lname_${i}" value="${escapeHtml(n)}" ${i < 2 ? 'style="opacity:0.5"' : ''}>
-        </div>`).join('');
-}
-
-async function tslSaveLabelNames() {
-    const names = Array.from({length: 10}, (_, i) => document.getElementById(`tsl_lname_${i}`)?.value || `Label ${i}`);
-    const r = await fetch('/api/tsl/label_names', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(names) });
-    if (r.ok) { mxlToast('Noms enregistrés', 'success'); _tslLabelNames = names; _tslRenderConns(); }
-    else       { mxlToast('Erreur sauvegarde', 'error'); }
 }
 
 // ── État tally ────────────────────────────────────────────────────────────────
