@@ -42,6 +42,34 @@
         </div>
     </div>
 
+    <!-- ─── Mapping indices ──────────────────────────────────────────────────── -->
+    <div id="tsl_mapping_panel" style="display:none">
+        <h2 id="tsl_mapping_title">Mapping indices — connexion</h2>
+        <div class="form">
+            <div class="meta" style="margin-bottom:var(--space-3)">
+                Association <em>index TSL → source (shm)</em> pour cette connexion.
+                Quand un paquet TSL est reçu avec cet index, la colonne label désignée
+                de la source correspondante est mise à jour.
+            </div>
+            <table id="tsl_map_table" style="width:100%;border-collapse:collapse;font-size:0.84em;margin-bottom:var(--space-3)">
+                <thead>
+                    <tr style="color:var(--text-muted);text-align:left;border-bottom:1px solid var(--border)">
+                        <th style="padding:var(--space-1) var(--space-2)">Index TSL</th>
+                        <th style="padding:var(--space-1) var(--space-2)">Source (shm)</th>
+                        <th style="padding:var(--space-1) var(--space-2)"></th>
+                    </tr>
+                </thead>
+                <tbody id="tsl_map_tbody">
+                    <tr><td colspan="3" class="meta" style="padding:var(--space-1) var(--space-2)">—</td></tr>
+                </tbody>
+            </table>
+            <div style="display:flex;gap:var(--space-3)">
+                <button class="btn" onclick="tslMappingAddRow()">+ Ajouter un index</button>
+                <button class="btn" onclick="tslMappingClose()">Fermer</button>
+            </div>
+        </div>
+    </div>
+
     <!-- ─── État tally ─────────────────────────────────────────────────────── -->
     <h2>État tally courant</h2>
     <div class="form">
@@ -117,6 +145,7 @@ function _tslRenderConns() {
             <td style="padding:var(--space-1) var(--space-2)">
                 <button class="btn btn-green" style="padding:2px 8px;font-size:0.8em" onclick="tslConnSave(${c.id})">Enreg.</button>
                 <button class="btn btn-red"   style="padding:2px 8px;font-size:0.8em;margin-left:4px" onclick="tslConnDel(${c.id})">✕</button>
+                <button class="btn"           style="padding:2px 8px;font-size:0.8em;margin-left:4px" onclick="tslMappingOpen(${c.id}, ${JSON.stringify(escapeHtml(c.name))})">Mapping</button>
             </td>
         </tr>`;
     }).join('');
@@ -181,5 +210,104 @@ function _tslRenderTallyState(state) {
 
 function escapeHtml(s) {
     return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// ── Mapping par connexion ─────────────────────────────────────────────────────
+let _tslActiveCid  = null;
+let _tslMapRows    = [];   // [{tsl_index, source_shm, _new}]
+let _tslSources    = [];   // [{shm, hostname}]  depuis /api/sources?kind=video
+
+async function tslMappingOpen(cid, connName) {
+    _tslActiveCid = cid;
+    document.getElementById('tsl_mapping_title').textContent = `Mapping indices — ${connName}`;
+    document.getElementById('tsl_mapping_panel').style.display = '';
+    document.getElementById('tsl_mapping_panel').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+
+    // Charger les sources système si pas encore fait
+    if (!_tslSources.length) {
+        try {
+            const r = await fetch('/api/sources?kind=video');
+            if (r.ok) _tslSources = (await r.json()).map(s => ({ shm: s.shm||s.shm_out||'', hostname: s.hostname||'' }));
+        } catch(e) {}
+    }
+
+    await _tslMapLoad();
+}
+
+function tslMappingClose() {
+    _tslActiveCid = null;
+    document.getElementById('tsl_mapping_panel').style.display = 'none';
+}
+
+async function _tslMapLoad() {
+    if (!_tslActiveCid) return;
+    try {
+        const r = await fetch(`/api/tsl/mapping/${_tslActiveCid}`);
+        _tslMapRows = r.ok ? (await r.json()).map(m => ({ ...m, _new: false })) : [];
+    } catch(e) { _tslMapRows = []; }
+    _tslMapRender();
+}
+
+function _tslMapRender() {
+    const tbody = document.getElementById('tsl_map_tbody');
+    if (!tbody) return;
+    if (!_tslMapRows.length) {
+        tbody.innerHTML = '<tr><td colspan="3" class="meta" style="padding:var(--space-1) var(--space-2)">Aucun mapping. Cliquez « + Ajouter ».</td></tr>';
+        return;
+    }
+
+    const shmOpts = '<option value="">— aucune —</option>' + _tslSources.map(s =>
+        `<option value="${escapeHtml(s.shm)}">${escapeHtml(s.hostname||s.shm)} → ${escapeHtml(s.shm)}</option>`
+    ).join('');
+
+    tbody.innerHTML = _tslMapRows.map((m, i) => {
+        const selOpts = shmOpts.replace(`value="${escapeHtml(m.source_shm)}"`, `value="${escapeHtml(m.source_shm)}" selected`);
+        const idxAttr = m._new ? '' : `disabled`;
+        return `<tr style="border-bottom:1px solid var(--border)" data-mi="${i}">
+            <td style="padding:var(--space-1) var(--space-2)">
+                <input type="number" class="tsl-m-idx" value="${m.tsl_index}" min="0" max="65535" style="width:80px" ${idxAttr}>
+            </td>
+            <td style="padding:var(--space-1) var(--space-2)">
+                <select class="tsl-m-shm" style="min-width:200px">${selOpts}</select>
+            </td>
+            <td style="padding:var(--space-1) var(--space-2)">
+                <button class="btn btn-green" style="padding:2px 8px;font-size:0.8em"
+                    onclick="tslMappingSave(${i})">Enreg.</button>
+                <button class="btn btn-red" style="padding:2px 8px;font-size:0.8em;margin-left:4px"
+                    onclick="tslMappingDel(${i}, ${m.tsl_index})">✕</button>
+            </td>
+        </tr>`;
+    }).join('');
+}
+
+function tslMappingAddRow() {
+    const maxIdx = _tslMapRows.reduce((m, r) => Math.max(m, r.tsl_index), -1);
+    _tslMapRows.push({ tsl_index: maxIdx + 1, source_shm: '', _new: true });
+    _tslMapRender();
+}
+
+async function tslMappingSave(i) {
+    if (!_tslActiveCid) return;
+    const row = document.querySelector(`[data-mi="${i}"]`);
+    if (!row) return;
+    const idx = parseInt(row.querySelector('.tsl-m-idx').value);
+    const shm = row.querySelector('.tsl-m-shm').value;
+    if (isNaN(idx)) { mxlToast('Index invalide', 'error'); return; }
+    const r = await fetch(`/api/tsl/mapping/${_tslActiveCid}/${idx}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ source_shm: shm })
+    });
+    if (r.ok) { mxlToast('Mapping enregistré', 'success'); await _tslMapLoad(); }
+    else       mxlToast('Erreur sauvegarde mapping', 'error');
+}
+
+async function tslMappingDel(i, idx) {
+    if (!_tslActiveCid) return;
+    if (_tslMapRows[i]?._new) { _tslMapRows.splice(i, 1); _tslMapRender(); return; }
+    if (!confirm(`Supprimer le mapping index ${idx} ?`)) return;
+    const r = await fetch(`/api/tsl/mapping/${_tslActiveCid}/${idx}`, { method: 'DELETE' });
+    if (r.ok) { mxlToast('Mapping supprimé', 'success'); await _tslMapLoad(); }
+    else       mxlToast('Erreur suppression mapping', 'error');
 }
 </script>

@@ -155,8 +155,10 @@ class _TslServer:
         # Mettre à jour la colonne label depuis le texte TSL (cols 2-9 seulement)
         if text and self.label_col >= 2:
             try:
-                from app.database import db_upsert_tsl_source
-                db_upsert_tsl_source(index, {f"label_{self.label_col}": text})
+                from app.database import db_get_source_for_tsl, db_upsert_source_label
+                shm = db_get_source_for_tsl(self.conn_id, index)
+                if shm:
+                    db_upsert_source_label(shm, {f"label_{self.label_col}": text})
             except Exception:
                 pass
 
@@ -255,7 +257,7 @@ class _TslServer:
 def _distributor():
     """Pousse tally + texte label vers chaque multiview selon sa flux_config."""
     import requests as _req
-    from app.database import (db_get_containers, db_get_tsl_source_label,
+    from app.database import (db_get_containers, db_get_source_label_for_shm,
                                db_get_setting)
 
     while not _stop_evt.is_set():
@@ -301,7 +303,7 @@ def _distributor():
                 color_l = state.get((tsl_index, tally_l_level), "off")
                 color_r = state.get((tsl_index, tally_r_level), "off")
                 try:
-                    text = db_get_tsl_source_label(tsl_index, label_col)
+                    text = db_get_source_label_for_shm(fc.get("shm") or "", label_col)
                 except Exception:
                     text = ""
 
@@ -429,8 +431,11 @@ def register_routes(bp):
     from app.database import (db_get_setting, db_set_setting,
                                db_get_tsl_connections, db_upsert_tsl_connection,
                                db_delete_tsl_connection,
-                               db_get_tsl_sources, db_upsert_tsl_source,
-                               db_delete_tsl_source, db_get_tsl_sources_by_shm)
+                               db_get_source_labels, db_upsert_source_label,
+                               db_delete_source_label, db_get_source_labels_by_shm,
+                               db_get_tsl_mapping, db_upsert_tsl_mapping,
+                               db_delete_tsl_mapping,
+                               db_get_tsl_sources_by_shm)
 
     # ── Connexions ────────────────────────────────────────────────────────────
 
@@ -467,50 +472,60 @@ def register_routes(bp):
         reload()
         return jsonify({"ok": True})
 
-    # ── Sources ───────────────────────────────────────────────────────────────
+    # ── Source labels ─────────────────────────────────────────────────────────
 
-    @bp.route("/api/tsl/sources", methods=["GET"])
+    @bp.route("/api/source_labels", methods=["GET"])
     @require_login
-    def tsl_sources_get():
-        return jsonify(db_get_tsl_sources())
+    def source_labels_get():
+        return jsonify(db_get_source_labels())
 
-    @bp.route("/api/tsl/sources", methods=["POST"])
+    @bp.route("/api/source_labels/batch", methods=["POST"])
     @require_perm("settings.edit")
-    def tsl_sources_upsert():
-        data = request.json or {}
-        idx = data.get("tsl_index")
-        if idx is None:
-            return jsonify({"error": "tsl_index requis"}), 400
-        fields = {k: v for k, v in data.items() if k != "tsl_index"}
-        db_upsert_tsl_source(int(idx), fields)
-        return jsonify({"ok": True})
-
-    @bp.route("/api/tsl/sources/<int:idx>", methods=["DELETE"])
-    @require_perm("settings.edit")
-    def tsl_source_delete(idx):
-        db_delete_tsl_source(idx)
-        return jsonify({"ok": True})
-
-    @bp.route("/api/tsl/sources/batch", methods=["POST"])
-    @require_perm("settings.edit")
-    def tsl_sources_batch():
+    def source_labels_batch():
         rows = request.json or []
         if not isinstance(rows, list):
             return jsonify({"error": "liste attendue"}), 400
         saved = 0
         for row in rows:
-            idx = row.get("tsl_index")
-            if idx is None:
+            shm = (row.get("shm") or "").strip()
+            if not shm:
                 continue
-            fields = {k: v for k, v in row.items() if k != "tsl_index"}
-            db_upsert_tsl_source(int(idx), fields)
+            fields = {k: v for k, v in row.items() if k != "shm"}
+            db_upsert_source_label(shm, fields)
             saved += 1
         return jsonify({"ok": True, "saved": saved})
+
+    @bp.route("/api/source_labels/<path:shm>", methods=["DELETE"])
+    @require_perm("settings.edit")
+    def source_label_delete(shm):
+        db_delete_source_label(shm)
+        return jsonify({"ok": True})
 
     @bp.route("/api/tsl/sources/by_shm", methods=["GET"])
     @require_login
     def tsl_sources_by_shm():
-        return jsonify(db_get_tsl_sources_by_shm())
+        return jsonify(db_get_source_labels_by_shm())
+
+    # ── Mapping par connexion ─────────────────────────────────────────────────
+
+    @bp.route("/api/tsl/mapping/<int:cid>", methods=["GET"])
+    @require_login
+    def tsl_mapping_for_conn(cid):
+        return jsonify(db_get_tsl_mapping(cid))
+
+    @bp.route("/api/tsl/mapping/<int:cid>/<int:idx>", methods=["POST", "PUT"])
+    @require_perm("settings.edit")
+    def tsl_mapping_upsert(cid, idx):
+        data = request.json or {}
+        source_shm = (data.get("source_shm") or "").strip()
+        db_upsert_tsl_mapping(cid, idx, source_shm)
+        return jsonify({"ok": True})
+
+    @bp.route("/api/tsl/mapping/<int:cid>/<int:idx>", methods=["DELETE"])
+    @require_perm("settings.edit")
+    def tsl_mapping_delete(cid, idx):
+        db_delete_tsl_mapping(cid, idx)
+        return jsonify({"ok": True})
 
     # ── Noms des colonnes ──────────────────────────────────────────────────────
 
@@ -570,16 +585,3 @@ def register_routes(bp):
         reload()
         return jsonify(status_dict())
 
-    @bp.route("/api/tsl/mapping", methods=["GET"])
-    @require_login
-    def tsl_mapping_get():
-        return jsonify(db_get_setting("tsl_mapping", []) or [])
-
-    @bp.route("/api/tsl/mapping", methods=["POST"])
-    @require_perm("settings.edit")
-    def tsl_mapping_set():
-        data = request.json
-        if not isinstance(data, list):
-            return jsonify({"error": "liste attendue"}), 400
-        db_set_setting("tsl_mapping", data)
-        return jsonify({"ok": True})
