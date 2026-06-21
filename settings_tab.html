@@ -215,7 +215,7 @@ function escapeHtml(s) {
 // ── Mapping par connexion ─────────────────────────────────────────────────────
 let _tslActiveCid  = null;
 let _tslMapRows    = [];   // [{tsl_index, source_shm, _new}]
-let _tslSources    = [];   // [{shm, hostname}]  depuis /api/sources?kind=video
+let _tslMapSources = [];   // [{shm, hostname}]  depuis /api/sources?kind=video
 
 async function tslMappingOpen(cid, connName) {
     _tslActiveCid = cid;
@@ -224,10 +224,10 @@ async function tslMappingOpen(cid, connName) {
     document.getElementById('tsl_mapping_panel').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 
     // Charger les sources système si pas encore fait
-    if (!_tslSources.length) {
+    if (!_tslMapSources.length) {
         try {
             const r = await fetch('/api/sources?kind=video');
-            if (r.ok) _tslSources = (await r.json()).map(s => ({ shm: s.shm||s.shm_out||'', hostname: s.hostname||'' }));
+            if (r.ok) _tslMapSources = (await r.json()).map(s => ({ shm: s.shm||s.shm_out||'', hostname: s.hostname||'' }));
         } catch(e) {}
     }
 
@@ -256,7 +256,7 @@ function _tslMapRender() {
         return;
     }
 
-    const shmOpts = '<option value="">— aucune —</option>' + _tslSources.map(s =>
+    const shmOpts = '<option value="">— aucune —</option>' + _tslMapSources.map(s =>
         `<option value="${escapeHtml(s.shm)}">${escapeHtml(s.hostname||s.shm)} → ${escapeHtml(s.shm)}</option>`
     ).join('');
 
