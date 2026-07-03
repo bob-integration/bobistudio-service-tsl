@@ -349,7 +349,10 @@ def _distributor():
                 if not conn:
                     continue
                 # Index TSL déduit de la source du PiP (pas saisi à la main en central).
-                shm = (fc.get("shm") or "").strip()
+                # flux_config[i] câble via "path" ("/dev/shm/<shm>"), jamais "shm" (cf. app/routes.py:750).
+                shm = (fc.get("path") or "").strip()
+                if shm.startswith("/dev/shm/"):
+                    shm = shm[len("/dev/shm/"):]
                 tsl_index = idx_by_conn_shm.get((int(conn.get("id") or 0), shm))
                 if tsl_index is None:
                     continue
@@ -361,7 +364,7 @@ def _distributor():
                 color_l = "red"   if (want_red   and state.get((tsl_index, r_lvl), "off") != "off") else "off"
                 color_r = "green" if (want_green and state.get((tsl_index, v_lvl), "off") != "off") else "off"
                 try:
-                    text = db_get_source_label_for_shm(fc.get("shm") or "", label_col)
+                    text = db_get_source_label_for_shm(shm, label_col)
                 except Exception:
                     text = ""
 
