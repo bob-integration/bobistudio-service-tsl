@@ -15,13 +15,14 @@
                     <th style="padding:var(--space-1) var(--space-2)">Port TCP</th>
                     <th style="padding:var(--space-1) var(--space-2)">Actif</th>
                     <th style="padding:var(--space-1) var(--space-2)">Colonne label</th>
-                    <th style="padding:var(--space-1) var(--space-2)">Tally base</th>
+                    <th style="padding:var(--space-1) var(--space-2)">Niveau de Tally</th>
+                    <th style="padding:var(--space-1) var(--space-2)">Rouge / Vert</th>
                     <th style="padding:var(--space-1) var(--space-2)">Statut</th>
                     <th style="padding:var(--space-1) var(--space-2)"></th>
                 </tr>
             </thead>
             <tbody id="tsl_conn_tbody">
-                <tr><td colspan="7" class="meta" style="padding:var(--space-1) var(--space-2)">—</td></tr>
+                <tr><td colspan="8" class="meta" style="padding:var(--space-1) var(--space-2)">—</td></tr>
             </tbody>
         </table>
         <div style="display:flex;gap:var(--space-3)">
@@ -33,8 +34,10 @@
     <h2>Sources TSL</h2>
     <div class="form">
         <div class="meta" style="margin-bottom:var(--space-3)">
-            Gestion avancée des sources : 100 index pré-initialisés, tri par colonne, filtres,
-            sélection multi-cellules et auto-incrément (style tableur).
+            Gestion avancée des sources : tri par colonne, filtres, sélection multi-cellules et
+            auto-incrément (style tableur). <strong>Le mapping index TSL → source s'y édite
+            désormais directement</strong> : une colonne d'index par connexion (recopie/auto-incrément
+            pour numéroter en masse). Le panneau « Mapping » ci-dessous reste une vue par connexion.
         </div>
         <div style="display:flex;align-items:center;gap:var(--space-3)">
             <a href="/labels" class="btn btn-blue">Ouvrir l'éditeur de labels →</a>
@@ -73,6 +76,13 @@
     <!-- ─── État tally ─────────────────────────────────────────────────────── -->
     <h2>État tally courant</h2>
     <div class="form">
+        <div class="meta" style="margin-bottom:var(--space-3)">
+            Tous les tallies actuellement actifs, regroupés par connexion (= niveau de Tally).
+            <strong>IDX</strong> = index TSL envoyé par le contrôleur (le numéro de source).
+            <strong>Rouge</strong> et <strong>Vert</strong> sont les champs définis par connexion
+            (colonne « Rouge / Vert » ci-dessus) ; la source associée (si mappée) est rappelée
+            à côté de l'index.
+        </div>
         <div id="tsl_tally_state" class="meta">—</div>
     </div>
 
@@ -83,19 +93,27 @@
 let _tslConns       = [];
 let _tslLabelNames  = [];
 let _tslSources     = [];
+let _tslMapByConn   = {};   // { connId: { tsl_index: source_shm } }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 async function rafraichirTsl() {
     try {
-        const [rc, rl, rs, rstate] = await Promise.all([
+        const [rc, rl, rs, rstate, rmap] = await Promise.all([
             fetch('/api/tsl/connections'),
             fetch('/api/tsl/label_names'),
             fetch('/api/tsl/sources'),
             fetch('/api/tsl/state'),
+            fetch('/api/tsl/mapping_all'),
         ]);
         if (rc.ok)     _tslConns      = await rc.json();
         if (rl.ok)     _tslLabelNames = await rl.json();
         if (rs.ok)     _tslSources    = await rs.json();
+        if (rmap.ok) {
+            _tslMapByConn = {};
+            for (const m of await rmap.json()) {
+                (_tslMapByConn[m.connection_id] ||= {})[m.tsl_index] = m.source_shm;
+            }
+        }
         _tslRenderConns();
         _tslRenderSrcSummary();
         if (rstate.ok) {
@@ -113,19 +131,46 @@ function _tslRenderSrcSummary() {
 }
 
 // ── Connexions ──────────────────────────────────────────────────────────────
+// Statut + dernier changement (extrait : réutilisé pour la mise à jour live en place)
+function _tslConnStatusHtml(c) {
+    const st = c.status || {};
+    const statusTxt = st.running ? `<span style="color:var(--status-running-fg)">Actif</span> · ${st.clients ?? 0} client(s)${st.uptime ? ' · ' + st.uptime : ''}`
+                    : (st.error  ? `<span style="color:var(--status-stopped-fg)">${escapeHtml(st.error)}</span>`
+                                 : `<span style="color:var(--text-muted)">Inactif</span>`);
+    const DOT = { red: '#cc2222', green: '#22aa44', amber: '#cc8800', off: '#555' };
+    const _dot = col => `<span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:${DOT[col]||'#555'};vertical-align:middle"></span>`;
+    let lastChangeTxt = '';
+    const lc = st.last_change;
+    if (lc) {
+        const ago = (lc.ago_s != null) ? ` · il y a ${lc.ago_s}s` : '';
+        const rougeOn = (lc[c.rouge_field || 'tt'] || 'off') !== 'off';
+        const vertOn  = (lc[c.vert_field  || 'lh'] || 'off') !== 'off';
+        lastChangeTxt = `<div class="meta" style="font-size:0.75em;margin-top:2px">
+            Dernier changement : IDX ${lc.index} · Rouge ${_dot(rougeOn ? 'red' : 'off')} Vert ${_dot(vertOn ? 'green' : 'off')}${ago}</div>`;
+    }
+    return statusTxt + lastChangeTxt;
+}
+
+// Mise à jour live des seules cellules de statut (ne touche pas aux champs éditables)
+function _tslUpdateConnStatus() {
+    const byId = {};
+    for (const c of _tslConns) byId[c.id] = c;
+    document.querySelectorAll('#tsl_conn_tbody td.tsl-c-status').forEach(td => {
+        const c = byId[+td.dataset.cid];
+        if (c) td.innerHTML = _tslConnStatusHtml(c);
+    });
+}
+
 function _tslRenderConns() {
     const tbody = document.getElementById('tsl_conn_tbody');
     if (!tbody) return;
     if (!_tslConns.length) {
-        tbody.innerHTML = '<tr><td colspan="7" class="meta" style="padding:var(--space-1) var(--space-2)">Aucune connexion. Cliquez « + Ajouter ».</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="8" class="meta" style="padding:var(--space-1) var(--space-2)">Aucune connexion. Cliquez « + Ajouter ».</td></tr>';
         return;
     }
-    const COLORS = { red: '#cc2222', green: '#22aa44', amber: '#cc8800', off: 'var(--text-muted)' };
+    const FIELD_OPTS = (sel) => ['lh','rh','tt'].map(f =>
+        `<option value="${f}" ${f === sel ? 'selected' : ''}>${f.toUpperCase()}</option>`).join('');
     tbody.innerHTML = _tslConns.map(c => {
-        const st = c.status || {};
-        const statusTxt = st.running ? `<span style="color:var(--status-running-fg)">Actif</span> · ${st.clients ?? 0} client(s)${st.uptime ? ' · ' + st.uptime : ''}`
-                        : (st.error  ? `<span style="color:var(--status-stopped-fg)">${escapeHtml(st.error)}</span>`
-                                     : `<span style="color:var(--text-muted)">Inactif</span>`);
         const colLabel = _tslLabelNames[c.label_col] || `Col ${c.label_col}`;
         return `<tr style="border-bottom:1px solid var(--border)" data-cid="${c.id}">
             <td style="padding:var(--space-1) var(--space-2)"><input type="text" class="tsl-c-name" value="${escapeHtml(c.name)}" style="width:140px"></td>
@@ -138,21 +183,25 @@ function _tslRenderConns() {
             </td>
             <td style="padding:var(--space-1) var(--space-2)">
                 <select class="tsl-c-tally-base">
-                    ${[0,3,6,9].map(b => `<option value="${b}" ${b === c.tally_base ? 'selected' : ''}>Niv. ${b}–${b+2}</option>`).join('')}
+                    ${[0,3,6,9].map(b => `<option value="${b}" ${b === c.tally_base ? 'selected' : ''}>Niveau ${b/3+1}</option>`).join('')}
                 </select>
             </td>
-            <td style="padding:var(--space-1) var(--space-2);font-size:0.8em">${statusTxt}</td>
+            <td style="padding:var(--space-1) var(--space-2);white-space:nowrap">
+                <span style="color:#cc2222">●</span> <select class="tsl-c-rouge" style="width:56px">${FIELD_OPTS(c.rouge_field || 'tt')}</select>
+                <span style="color:#22aa44;margin-left:4px">●</span> <select class="tsl-c-vert" style="width:56px">${FIELD_OPTS(c.vert_field || 'lh')}</select>
+            </td>
+            <td class="tsl-c-status" data-cid="${c.id}" style="padding:var(--space-1) var(--space-2);font-size:0.8em">${_tslConnStatusHtml(c)}</td>
             <td style="padding:var(--space-1) var(--space-2)">
                 <button class="btn btn-green" style="padding:2px 8px;font-size:0.8em" onclick="tslConnSave(${c.id})">Enreg.</button>
                 <button class="btn btn-red"   style="padding:2px 8px;font-size:0.8em;margin-left:4px" onclick="tslConnDel(${c.id})">✕</button>
-                <button class="btn"           style="padding:2px 8px;font-size:0.8em;margin-left:4px" onclick="tslMappingOpen(${c.id}, ${JSON.stringify(escapeHtml(c.name))})">Mapping</button>
+                <button class="btn"           style="padding:2px 8px;font-size:0.8em;margin-left:4px" onclick="tslMappingOpen(${c.id})">Mapping</button>
             </td>
         </tr>`;
     }).join('');
 }
 
 function tslConnAdd() {
-    _tslConns.push({ id: null, name: 'Nouvelle connexion', port: 12345, enabled: 0, label_col: 2, tally_base: 0, status: {} });
+    _tslConns.push({ id: null, name: 'Nouvelle connexion', port: 12345, enabled: 0, label_col: 2, tally_base: 0, rouge_field: 'tt', vert_field: 'lh', status: {} });
     _tslRenderConns();
 }
 
@@ -167,6 +216,8 @@ async function tslConnSave(cid) {
         enabled:    row.querySelector('.tsl-c-enabled').checked ? 1 : 0,
         label_col:  parseInt(row.querySelector('.tsl-c-label-col').value) || 2,
         tally_base: parseInt(row.querySelector('.tsl-c-tally-base').value) || 0,
+        rouge_field: row.querySelector('.tsl-c-rouge').value || 'tt',
+        vert_field:  row.querySelector('.tsl-c-vert').value || 'lh',
     };
     const url    = cid ? `/api/tsl/connections/${cid}` : '/api/tsl/connections';
     const method = cid ? 'PUT' : 'POST';
@@ -183,29 +234,46 @@ async function tslConnDel(cid) {
 }
 
 // ── État tally ────────────────────────────────────────────────────────────────
+// Tous les tallies actifs, regroupés par protocole (connexion). Niveaux = LH/RH/TT
+// dérivés du tally_base de chaque connexion. On n'affiche que les index réellement actifs.
 function _tslRenderTallyState(state) {
     const el = document.getElementById('tsl_tally_state');
     if (!el) return;
-    const keys = Object.keys(state || {});
-    if (!keys.length) { el.textContent = 'Aucun tally actif'; return; }
-    const COLORS = { red: '#cc2222', green: '#22aa44', amber: '#cc8800', off: 'var(--text-muted)' };
-    const byIdx = {};
-    for (const k of keys) {
-        const [idx, lvl] = k.split('_').map(Number);
-        if (!byIdx[idx]) byIdx[idx] = {};
-        byIdx[idx][lvl] = state[k];
+    const COLORS = { red: '#cc2222', green: '#22aa44', amber: '#cc8800', off: '#555' };
+    const dot = c => `<span style="display:inline-block;width:9px;height:9px;border-radius:50%;background:${COLORS[c]||'#555'};vertical-align:middle"></span>`;
+
+    const OFF = { lh: 0, rh: 1, tt: 2 };
+    let html = '';
+    let anyActive = false;
+    for (const conn of (_tslConns || [])) {
+        const base = conn.tally_base || 0;
+        const map  = _tslMapByConn[conn.id] || {};
+        const rOff = OFF[conn.rouge_field || 'tt'] ?? 2;   // niveau Rouge de cette connexion
+        const vOff = OFF[conn.vert_field  || 'lh'] ?? 0;   // niveau Vert
+        // index présents pour les niveaux de cette connexion
+        const idxSet = new Set();
+        for (const k of Object.keys(state || {})) {
+            const [idx, lvl] = k.split('_').map(Number);
+            if (lvl === base || lvl === base + 1 || lvl === base + 2) idxSet.add(idx);
+        }
+        const rows = [];
+        for (const idx of [...idxSet].sort((a, b) => a - b)) {
+            const rougeOn = (state[`${idx}_${base + rOff}`] || 'off') !== 'off';
+            const vertOn  = (state[`${idx}_${base + vOff}`] || 'off') !== 'off';
+            if (!rougeOn && !vertOn) continue;   // actifs uniquement
+            const shm = map[idx];
+            const src = shm ? ` <span class="meta" style="font-size:0.85em">${escapeHtml(shm)}</span>` : '';
+            rows.push(`<div style="margin:2px 0;font-size:0.86em">
+                <strong>IDX ${idx}</strong>${src} — Rouge ${dot(rougeOn ? 'red' : 'off')} Vert ${dot(vertOn ? 'green' : 'off')}</div>`);
+        }
+        if (rows.length) {
+            anyActive = true;
+            html += `<div style="margin-bottom:var(--space-2)">
+                <div style="font-weight:600;font-size:0.85em;margin-bottom:2px">${escapeHtml(conn.name)}</div>
+                ${rows.join('')}</div>`;
+        }
     }
-    el.innerHTML = Object.keys(byIdx).sort((a,b)=>a-b).map(idx => {
-        const lvls = byIdx[idx];
-        const lvlBadges = Object.keys(lvls).sort((a,b)=>a-b).map(lvl => {
-            const c = lvls[lvl];
-            const n = _tslLabelNames[lvl] || `Niv.${lvl}`;
-            return `<span style="display:inline-flex;align-items:center;gap:3px;margin-right:8px;font-size:0.82em">
-                <span style="width:8px;height:8px;border-radius:50%;background:${COLORS[c]||'#444'}"></span>${n}: <strong>${c}</strong>
-            </span>`;
-        }).join('');
-        return `<div style="margin-bottom:var(--space-1)"><strong>IDX ${idx}</strong> — ${lvlBadges}</div>`;
-    }).join('');
+    el.innerHTML = anyActive ? html : 'Aucun tally actif';
 }
 
 function escapeHtml(s) {
@@ -217,8 +285,10 @@ let _tslActiveCid  = null;
 let _tslMapRows    = [];   // [{tsl_index, source_shm, _new}]
 let _tslMapSources = [];   // [{shm, hostname}]  depuis /api/sources?kind=video
 
-async function tslMappingOpen(cid, connName) {
+async function tslMappingOpen(cid) {
     _tslActiveCid = cid;
+    const conn = _tslConns.find(x => x.id === cid);
+    const connName = conn ? conn.name : `#${cid}`;
     document.getElementById('tsl_mapping_title').textContent = `Mapping indices — ${connName}`;
     document.getElementById('tsl_mapping_panel').style.display = '';
     document.getElementById('tsl_mapping_panel').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
@@ -256,12 +326,17 @@ function _tslMapRender() {
         return;
     }
 
+    const known = new Set(_tslMapSources.map(s => s.shm));
     const shmOpts = '<option value="">— aucune —</option>' + _tslMapSources.map(s =>
         `<option value="${escapeHtml(s.shm)}">${escapeHtml(s.hostname||s.shm)} → ${escapeHtml(s.shm)}</option>`
     ).join('');
 
     tbody.innerHTML = _tslMapRows.map((m, i) => {
-        const selOpts = shmOpts.replace(`value="${escapeHtml(m.source_shm)}"`, `value="${escapeHtml(m.source_shm)}" selected`);
+        // Préserver une source mappée qui n'est plus produite (sinon « Enreg. » l'écraserait)
+        const extra = (m.source_shm && !known.has(m.source_shm))
+            ? `<option value="${escapeHtml(m.source_shm)}">${escapeHtml(m.source_shm)} (hors liste)</option>`
+            : '';
+        const selOpts = (shmOpts + extra).replace(`value="${escapeHtml(m.source_shm)}"`, `value="${escapeHtml(m.source_shm)}" selected`);
         const idxAttr = m._new ? '' : `disabled`;
         return `<tr style="border-bottom:1px solid var(--border)" data-mi="${i}">
             <td style="padding:var(--space-1) var(--space-2)">
@@ -310,4 +385,23 @@ async function tslMappingDel(i, idx) {
     if (r.ok) { mxlToast('Mapping supprimé', 'success'); await _tslMapLoad(); }
     else       mxlToast('Erreur suppression mapping', 'error');
 }
+
+// ── Rafraîchissement live (≥2 Hz) — uniquement quand l'onglet TSL est visible ──
+// Ne ré-interroge que l'état + les connexions (léger) ; mises à jour en place pour
+// ne pas écraser les champs en cours d'édition. Le reste (mappings, sources, noms
+// de colonnes) est chargé par rafraichirTsl() à l'ouverture de l'onglet.
+async function _tslLivePoll() {
+    const tab = document.getElementById('protocoles-tab-tsl');
+    if (!tab || tab.offsetParent === null) return;   // onglet non affiché → ne rien faire
+    try {
+        const [rc, rstate] = await Promise.all([
+            fetch('/api/tsl/connections'),
+            fetch('/api/tsl/state'),
+        ]);
+        if (rc.ok)     _tslConns = await rc.json();
+        _tslUpdateConnStatus();
+        if (rstate.ok) _tslRenderTallyState(await rstate.json());
+    } catch(e) { /* silencieux : poll best-effort */ }
+}
+setInterval(_tslLivePoll, 400);   // 2,5 Hz
 </script>

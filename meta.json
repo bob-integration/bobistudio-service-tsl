@@ -1,8 +1,13 @@
 {
-  "version": "0.2.0",
-  "published_at": "2026-06-12",
+  "version": "0.2.1",
+  "published_at": "2026-06-30",
   "changes": {
     "Nouveautés": [
+      "Mapping index→source éditable au tableur (page Labels) : une colonne d'index TSL par connexion, avec auto-incrément/recopie, copier-coller et détection de doublons — alternative au panneau « Mapping » par connexion",
+      "Temps réel (≥2 Hz) : page Protocoles (état tally + statut/dernier changement des connexions, maj en place sans écraser les champs) et tableur Labels (pastille de tally live LH/RH/TT par cellule d'index) rafraîchis toutes les 400 ms pour le debug tally/UMD",
+      "Tableur Labels : les colonnes labels se mettent à jour en direct quand le texte change (TSL text/UMD), avec flash de la cellule modifiée — les lignes éditées localement (non enregistrées) ne sont jamais écrasées",
+      "Connexions : affichage du dernier CHANGEMENT d'état tally par connexion (IDX + LH/RH/TT + âge) au lieu du dernier paquet reçu (qui défilait à chaque keepalive)",
+      "État tally courant : tous les tallies actifs regroupés par protocole (connexion), niveaux étiquetés LH/RH/TT (au lieu des noms de colonnes labels, qui prêtaient à confusion), source mappée rappelée + légende explicative",
       "Multi-connexions TSL : plusieurs serveurs TCP simultanés, chacun avec son port, sa colonne label et sa base tally",
       "10 niveaux tally par index (1 niveau = 1 bit natif LH/RH/TT d'une connexion TSL)",
       "10 colonnes labels par source (col 0=hostname auto, col 1=MXL auto, cols 2-9 éditables)",
@@ -12,7 +17,13 @@
       "Page Câbles : sélecteur de colonne label TSL global (localStorage)",
       "Migration automatique de l'ancienne config tsl_enabled/tsl_port vers tsl_connections"
     ],
-    "Corrections": [],
+    "Corrections": [
+      "Réception : l'index TSL (display index) était lu au mauvais offset → tous les paquets retombaient sur l'index 0 (tally + labels de toutes les sources écrasés sur la 1ʳᵉ). Offset réel vérifié par capture du fil VSM = 8 (SOM@0 LEN@2 VER/FLAGS@4 SCREEN@6 INDEX@8 CONTROL@10 LENGTH@12 TEXT@14). Routage par source désormais correct",
+      "Labels : enregistrement perdait les index TSL saisis si une cellule était encore en cours d'édition (valeur non « committée ») → tslSave committe l'édition en cours avant de lire",
+      "Labels : la recherche globale n'incluait pas les colonnes d'index TSL (un numéro recherché masquait les lignes) → colonnes TSL ajoutées au filtre global",
+      "Bouton « Mapping » des connexions inopérant : le nom de connexion passé via JSON.stringify cassait l'attribut onclick (guillemets doubles imbriqués) → le clic n'ouvrait jamais le panneau",
+      "Mapping indices : une source mappée mais non listée (producteur arrêté) s'affichait « — aucune — » et risquait d'être écrasée à l'enregistrement → option « (hors liste) » préservée"
+    ],
     "Bugs connus": []
   }
 }

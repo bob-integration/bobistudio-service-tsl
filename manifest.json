@@ -11,7 +11,7 @@
       "default": ["Hostname", "MXL", "Label 2", "Label 3", "Label 4", "Label 5", "Label 6", "Label 7", "Label 8", "Label 9"]
     }
   },
-  "version": "0.2.0",
+  "version": "0.2.1",
   "order": 4,
   "description": "Service TSL 5.0 centralisé — multi-connexions, 10 niveaux tally (LH/RH/TT par connexion), 10 colonnes labels par source. Distribution automatique vers les multiviews."
 }

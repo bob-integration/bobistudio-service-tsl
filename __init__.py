@@ -9,10 +9,10 @@ Chaque connexion TSL (tsl_connections DB) ouvre son propre serveur TCP.
 Le tally est stocké par (index, niveau) où niveau = tally_base + {0=LH, 1=RH, 2=TT}.
 Le distributor lit les deploy_config des multiviews et envoie color + text par fenêtre.
 
-Protocole TSL 5.0 :
-  SOM(2=0xFE02) + VER(1) + FLAGS(1) + SCREEN(2LE) + INDEX(2LE)
-  + EXTRA(2) + CONTROL(2LE) + LENGTH(2LE) + TEXT(LENGTH bytes Latin-1)
-CONTROL bits : 0-1=RH tally, 2-3=TT tally, 4-5=LH tally  (0=off 1=red 2=green 3=amber)
+Protocole TSL 5.0 (offsets vérifiés sur le fil VSM, capture 2026-06-30) :
+  SOM `FE 02`@0 + LEN(2LE)@2 + VER/FLAGS@4 + SCREEN(2LE)@6 + INDEX(2LE)@8
+  + CONTROL(2LE)@10 + LENGTH(2LE)@12 + TEXT@14 (LENGTH bytes Latin-1)
+INDEX = display index (la source). CONTROL bits : 0-1=RH, 2-3=TT, 4-5=LH (0=off 1=red 2=green 3=amber)
 """
 import json
 import logging
@@ -64,6 +64,14 @@ class _TslServer:
         self.started_at = None
         self.last_pkt   = None
         self.last_error = ""
+        # dernier paquet reçu (diagnostic interne, non affiché)
+        self.last_index   = None
+        self.last_control = None
+        self.last_text    = ""
+        # dernier CHANGEMENT d'état tally (affiché — pas chaque keepalive)
+        self.last_change        = None   # ts
+        self.last_change_idx    = None
+        self.last_change_colors = None   # {"lh","rh","tt"}
         # keepalive tracker : (index, 'rh'|'tt'|'lh') → [value, ts, interval_s]
         self._slots: dict    = {}
         self._combined: dict = {}
@@ -90,7 +98,10 @@ class _TslServer:
         now = time.monotonic()
 
         with self._lock:
-            self.last_pkt = time.time()
+            self.last_pkt     = time.time()
+            self.last_index   = index
+            self.last_control = control
+            self.last_text    = text
             if (control & 0x3F) == 0:
                 for s in ('rh', 'tt', 'lh'):
                     self._slots.pop((index, s), None)
@@ -151,6 +162,14 @@ class _TslServer:
                     changed = True
         if changed:
             _tally_dirty.set()
+            with self._lock:
+                self.last_change        = time.time()
+                self.last_change_idx    = index
+                self.last_change_colors = {
+                    "lh": colors[self.tally_base],
+                    "rh": colors[self.tally_base + 1],
+                    "tt": colors[self.tally_base + 2],
+                }
 
         # Mettre à jour la colonne label depuis le texte TSL (cols 2-9 seulement)
         if text and self.label_col >= 2:
@@ -176,7 +195,7 @@ class _TslServer:
             total   = 14 + length
             if len(buf) < total:
                 return buf
-            index = struct.unpack_from("<H", buf, 6)[0]
+            index = struct.unpack_from("<H", buf, 8)[0]   # display index @ offset 8 (vérifié sur le fil VSM)
             text  = buf[14:14 + length].decode("latin-1", errors="replace") if length else ""
             buf   = buf[total:]
             self._apply_tsl(index, control, text)
@@ -240,6 +259,13 @@ class _TslServer:
                 s = int(time.time() - self.started_at)
                 up = f"{s//3600:02d}:{(s%3600)//60:02d}:{s%60:02d}"
             last_ago = round(time.time() - self.last_pkt, 1) if self.last_pkt else None
+            last_change = None
+            if self.last_change:
+                last_change = {
+                    "index":  self.last_change_idx,
+                    **(self.last_change_colors or {}),
+                    "ago_s":  round(time.time() - self.last_change, 1),
+                }
             return {
                 "conn_id":       self.conn_id,
                 "port":          self.port,
@@ -249,6 +275,7 @@ class _TslServer:
                 "clients":       self.clients,
                 "uptime":        up,
                 "last_pkt_ago_s": last_ago,
+                "last_change":   last_change,
                 "error":         self.last_error,
             }
 
@@ -258,7 +285,9 @@ def _distributor():
     """Pousse tally + texte label vers chaque multiview selon sa flux_config."""
     import requests as _req
     from app.database import (db_get_containers, db_get_source_label_for_shm,
-                               db_get_setting)
+                               db_get_setting, db_get_tsl_connections,
+                               db_get_tsl_mappings_all)
+    _OFF = {"lh": 0, "rh": 1, "tt": 2}
 
     while not _stop_evt.is_set():
         _tally_dirty.wait(timeout=0.1)
@@ -271,10 +300,22 @@ def _distributor():
 
         try:
             containers = db_get_containers()
+            # Niveau de Tally = bande tally_base : indexer les connexions actives par bande.
+            conns_by_base = {int(c.get("tally_base") or 0): c
+                             for c in db_get_tsl_connections() if c.get("enabled")}
+            # En central l'index TSL d'un PiP est déduit de SA source : lookup inverse
+            # (connexion, source_shm) → tsl_index dans le tsl_mapping.
+            idx_by_conn_shm: dict = {}
+            for m in db_get_tsl_mappings_all():
+                shm_m = (m.get("source_shm") or "").strip()
+                if shm_m:
+                    idx_by_conn_shm[(int(m.get("connection_id") or 0), shm_m)] = \
+                        int(m.get("tsl_index") or 0)
         except Exception:
             continue
 
         updates_by_vmid: dict = {}
+        overlays_by_vmid: dict = {}
         for ct in containers:
             dc_raw = ct.get("deploy_config")
             if not dc_raw:
@@ -286,22 +327,39 @@ def _distributor():
             if (dc.get("type") or "") != "multiview":
                 continue
             params = dc.get("params") or {}
+            # Mode Direct : le multiview reçoit le TSL via son serveur local → ne pas double-piloter.
+            tsl_mode = params.get("tsl_mode") or (
+                "direct" if (int(params.get("tsl_port") or 0) > 0 and not params.get("tsl_remote"))
+                else "central")
+            if tsl_mode == "direct":
+                continue
             flux_config = params.get("flux_config") or []
             vmid = ct["vmid"]
             for i, fc in enumerate(flux_config):
                 if not isinstance(fc, dict):
                     continue
-                if not fc.get("show_tally"):
+                # Niveau de Tally (1-4) = bande tally_base ; couleurs = Rouge/Vert cochées.
+                niveau = int(fc.get("tally_level") or 0)
+                want_red   = bool(fc.get("tally_red"))
+                want_green = bool(fc.get("tally_green"))
+                if not niveau or not (want_red or want_green):
                     continue
-                tsl_index = int(fc.get("tsl_index") or 0)
-                if not tsl_index:
+                base = (niveau - 1) * 3
+                conn = conns_by_base.get(base)        # connexion servant ce niveau (Rouge/Vert)
+                if not conn:
                     continue
-                tally_l_level = int(fc.get("tally_l_level") or 0)
-                tally_r_level = int(fc.get("tally_r_level") or 1)
-                label_col     = int(fc.get("label_col") or 0)
+                # Index TSL déduit de la source du PiP (pas saisi à la main en central).
+                shm = (fc.get("shm") or "").strip()
+                tsl_index = idx_by_conn_shm.get((int(conn.get("id") or 0), shm))
+                if tsl_index is None:
+                    continue
+                r_lvl  = base + _OFF.get(conn.get("rouge_field") or "tt", 2)
+                v_lvl  = base + _OFF.get(conn.get("vert_field")  or "lh", 0)
+                label_col = int(fc.get("label_col") or 0)
 
-                color_l = state.get((tsl_index, tally_l_level), "off")
-                color_r = state.get((tsl_index, tally_r_level), "off")
+                # Couleur FORCÉE (Rouge/Vert) si le champ correspondant est actif (≠ off).
+                color_l = "red"   if (want_red   and state.get((tsl_index, r_lvl), "off") != "off") else "off"
+                color_r = "green" if (want_green and state.get((tsl_index, v_lvl), "off") != "off") else "off"
                 try:
                     text = db_get_source_label_for_shm(fc.get("shm") or "", label_col)
                 except Exception:
@@ -311,14 +369,45 @@ def _distributor():
                 upd.append({"flux_idx": i, "slot": "L", "color": color_l, "text": text})
                 upd.append({"flux_idx": i, "slot": "R", "color": color_r, "text": text})
 
+            # Overlays texte « TSL/Tableau » : reliés à une LIGNE du tableau /labels (label_row)
+            # + une colonne (texte) + un niveau de Tally (allumage). Tout résolu côté orchestrateur.
+            for ov in (params.get("overlays") or []):
+                if not isinstance(ov, dict) or (ov.get("kind") or "") != "text":
+                    continue
+                if (ov.get("text_source") or "local") != "tsl":
+                    continue
+                row_shm = (ov.get("label_row") or "").strip()
+                if not row_shm:
+                    continue
+                try:
+                    o_text = db_get_source_label_for_shm(row_shm, int(ov.get("label_col") or 0))
+                except Exception:
+                    o_text = ""
+                active = False
+                o_niveau = int(ov.get("tally_level") or 0)
+                if o_niveau and (ov.get("tally_red") or ov.get("tally_green")):
+                    o_base = (o_niveau - 1) * 3
+                    o_conn = conns_by_base.get(o_base)
+                    if o_conn:
+                        o_idx = idx_by_conn_shm.get((int(o_conn.get("id") or 0), row_shm))
+                        if o_idx is not None:
+                            r_l = o_base + _OFF.get(o_conn.get("rouge_field") or "tt", 2)
+                            v_l = o_base + _OFF.get(o_conn.get("vert_field")  or "lh", 0)
+                            red_on   = bool(ov.get("tally_red"))   and state.get((o_idx, r_l), "off") != "off"
+                            green_on = bool(ov.get("tally_green")) and state.get((o_idx, v_l), "off") != "off"
+                            active = red_on or green_on
+                ovl = overlays_by_vmid.setdefault(vmid, [])
+                ovl.append({"id": ov.get("id"), "text": o_text, "active": active})
+
         from app.metrics import get_container_ip
-        for vmid, updates in updates_by_vmid.items():
+        for vmid in set(updates_by_vmid) | set(overlays_by_vmid):
             try:
                 ip = get_container_ip(vmid)
                 if not ip:
                     continue
                 _req.post(f"http://{ip}:8080/tally_bulk",
-                          json={"updates": updates}, timeout=1)
+                          json={"updates": updates_by_vmid.get(vmid, []),
+                                "overlays": overlays_by_vmid.get(vmid, [])}, timeout=1)
             except Exception:
                 pass
 
@@ -434,7 +523,8 @@ def register_routes(bp):
                                db_get_source_labels, db_upsert_source_label,
                                db_delete_source_label, db_get_source_labels_by_shm,
                                db_get_tsl_mapping, db_upsert_tsl_mapping,
-                               db_delete_tsl_mapping,
+                               db_delete_tsl_mapping, db_get_tsl_mappings_all,
+                               db_set_tsl_mapping_for_source,
                                db_get_tsl_sources_by_shm)
 
     # ── Connexions ────────────────────────────────────────────────────────────
@@ -546,6 +636,31 @@ def register_routes(bp):
         db_delete_tsl_mapping(cid, idx)
         return jsonify({"ok": True})
 
+    # ── Mapping vu par-source (éditeur de labels, colonnes par connexion) ──────
+
+    @bp.route("/api/tsl/mapping_all", methods=["GET"])
+    @require_login
+    def tsl_mapping_all():
+        return jsonify(db_get_tsl_mappings_all())
+
+    @bp.route("/api/tsl/mapping/by_source/batch", methods=["POST"])
+    @require_perm("settings.edit")
+    def tsl_mapping_by_source_batch():
+        rows = request.json or []
+        if not isinstance(rows, list):
+            return jsonify({"error": "liste attendue"}), 400
+        saved = 0
+        for row in rows:
+            shm = (row.get("shm") or "").strip()
+            if not shm or row.get("connection_id") is None:
+                continue
+            idx = row.get("tsl_index")
+            if isinstance(idx, str):
+                idx = idx.strip() or None
+            db_set_tsl_mapping_for_source(int(row["connection_id"]), shm, idx)
+            saved += 1
+        return jsonify({"ok": True, "saved": saved})
+
     # ── Noms des colonnes ──────────────────────────────────────────────────────
 
     @bp.route("/api/tsl/label_names", methods=["GET"])
@@ -565,6 +680,7 @@ def register_routes(bp):
             return jsonify({"error": "liste de 10 noms attendue"}), 400
         db_set_setting("tsl_label_names", [str(n) for n in data])
         return jsonify({"ok": True})
+
 
     # ── État tally ────────────────────────────────────────────────────────────
 
