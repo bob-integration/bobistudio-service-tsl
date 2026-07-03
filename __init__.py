@@ -342,7 +342,8 @@ def _distributor():
                 niveau = int(fc.get("tally_level") or 0)
                 want_red   = bool(fc.get("tally_red"))
                 want_green = bool(fc.get("tally_green"))
-                if not niveau or not (want_red or want_green):
+                want_text  = fc.get("label_source") == "protocol"
+                if not niveau or not (want_red or want_green or want_text):
                     continue
                 base = (niveau - 1) * 3
                 conn = conns_by_base.get(base)        # connexion servant ce niveau (Rouge/Vert)
