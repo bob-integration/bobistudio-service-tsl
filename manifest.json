@@ -8,10 +8,46 @@
   "settings_keys": {
     "tsl_label_names": {
       "type": "json",
-      "default": ["Hostname", "MXL", "Label 2", "Label 3", "Label 4", "Label 5", "Label 6", "Label 7", "Label 8", "Label 9"]
+      "default": [
+        "Hostname",
+        "MXL",
+        "Label 2",
+        "Label 3",
+        "Label 4",
+        "Label 5",
+        "Label 6",
+        "Label 7",
+        "Label 8",
+        "Label 9"
+      ]
     }
   },
   "version": "0.2.1",
   "order": 4,
-  "description": "Service TSL 5.0 centralisé — multi-connexions, 10 niveaux tally (LH/RH/TT par connexion), 10 colonnes labels par source. Distribution automatique vers les multiviews."
+  "description": "Service TSL 5.0 centralisé — multi-connexions, 10 niveaux tally (LH/RH/TT par connexion), 10 colonnes labels par source. Distribution automatique vers les multiviews.",
+  "actions": [
+    {
+      "id": "set_label",
+      "label": "Écrire un label source",
+      "availability": "project",
+      "params": [
+        {
+          "key": "ref",
+          "label": "Source (shm ou port)",
+          "type": "text"
+        },
+        {
+          "key": "col",
+          "label": "Colonne (2-9)",
+          "type": "number",
+          "default": 2
+        },
+        {
+          "key": "text",
+          "label": "Texte",
+          "type": "text"
+        }
+      ]
+    }
+  ]
 }

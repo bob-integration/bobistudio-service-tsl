@@ -821,6 +821,58 @@ def get_tally_state() -> dict:
     with _lock:
         return {f"{idx}_{lvl}": color for (idx, lvl), color in _tally_state.items()}
 
+
+# ─── Actions de service (chantier 6 — macros/shotbox) ─────────────────────────
+def run_action(action_id, params, ctx):
+    """`tsl.set_label(ref, col, text)` : écrit une colonne de label d'une source.
+    En contexte PROJET (ctx.project_id), la cible est BORNÉE aux refs du projet :
+    un de ses ports (« port:<id> ») ou un shm produit par un de ses containers."""
+    if action_id != "set_label":
+        raise RuntimeError(f"action inconnue : {action_id}")
+    ref = (params.get("ref") or "").strip()
+    text = str(params.get("text") if params.get("text") is not None else "")
+    try:
+        col = int(params.get("col") or 2)
+    except (TypeError, ValueError):
+        col = 2
+    if not ref:
+        raise RuntimeError("ref requis (shm ou port:<id>)")
+    if not (2 <= col <= 9):
+        raise RuntimeError("col hors plage (2-9)")
+    pid = (ctx or {}).get("project_id")
+    if pid:
+        ok = False
+        if ref.startswith("port:"):
+            port = _ports_snapshot()["by_id"].get(int(ref[5:]) if ref[5:].isdigit() else -1)
+            ok = bool(port and port.get("project_id") == pid)
+        else:
+            # shm produit par un container du projet ?
+            from app.database import db_get_containers
+            from app.auth import vmid_project_ids
+            from app import plugins as _plugins
+            for c in db_get_containers():
+                if pid not in vmid_project_ids(c["vmid"]):
+                    continue
+                dc = c.get("deploy_config")
+                dc = json.loads(dc) if isinstance(dc, str) else (dc or {})
+                t, p = dc.get("type"), (dc.get("params") or {})
+                if not _plugins.is_plugin(t):
+                    continue
+                hn = p.get("hostname") or c.get("hostname") or ""
+                try:
+                    if any(pr.get("shm") == ref for pr in
+                           _plugins.derive_wiring(t, hn, p)["produces"]):
+                        ok = True
+                        break
+                except Exception:
+                    continue
+        if not ok:
+            raise RuntimeError(f"« {ref} » n'appartient pas au projet (ports/sorties du projet seulement)")
+    from app.database import db_upsert_source_label
+    db_upsert_source_label(ref, {f"label_{col}": text})
+    _tally_dirty.set()   # les multiviews re-résolvent leurs labels
+    return True
+
 def get_tally_level(tsl_index: int, level: int) -> str:
     with _lock:
         return _tally_state.get((tsl_index, level), "off")
