@@ -47,6 +47,74 @@ def _tsl_color(val):
     if val == 3: return "amber"
     return "red"
 
+_COLOR_CODE = {"off": 0, "red": 1, "green": 2, "amber": 3}
+_OFF_FIELD  = {"lh": 0, "rh": 1, "tt": 2}
+
+
+# ─── Ports virtuels de projet (chantier 4/5) ──────────────────────────────────
+# Un mapping/label peut référencer "port:<id>" au lieu d'un shm brut : l'adresse reste
+# stable côté contrôleur broadcast, le binding du port suit les rebinds/chargements.
+_ports_cache = {"ts": 0.0, "by_id": {}, "by_pid": {}}
+
+def _ports_snapshot():
+    import time as _t
+    now = _t.monotonic()
+    if now - _ports_cache["ts"] > 3.0:
+        try:
+            from app.database import db_project_ports
+            ports = db_project_ports(None)
+        except Exception:
+            ports = []
+        _ports_cache["by_id"] = {p["id"]: p for p in ports}
+        by_pid: dict = {}
+        for p in ports:
+            by_pid.setdefault(p["project_id"], []).append(p)
+        _ports_cache["by_pid"] = by_pid
+        _ports_cache["ts"] = now
+    return _ports_cache
+
+def _port_shm(port):
+    """shm réel d'un port : binding.shm (source) ou binding.internal_shm (destination)."""
+    b = (port or {}).get("binding") or {}
+    return (b.get("shm") if (port or {}).get("kind") == "source"
+            else b.get("internal_shm")) or None
+
+def resolve_ref(ref):
+    """"port:<id>" → shm réel du binding ; sinon renvoie ref tel quel."""
+    ref = (ref or "").strip()
+    if ref.startswith("port:"):
+        try:
+            port = _ports_snapshot()["by_id"].get(int(ref[5:]))
+        except (TypeError, ValueError):
+            port = None
+        return _port_shm(port)
+    return ref
+
+
+# ─── Encodeur TSL 5.0 (miroir du parser — offsets vérifiés sur le fil VSM) ────
+def encode_tsl_frame(index: int, control: int, text: str = "") -> bytes:
+    """SOM(2) + LEN(2) + VER/FLAGS(2) + SCREEN(2) + INDEX(2) + CONTROL(2)
+    + LENGTH(2) + TEXT (Latin-1)."""
+    raw = (text or "").encode("latin-1", errors="replace")
+    return (TSL_SOM
+            + struct.pack("<H", 10 + len(raw))   # octets après le champ LEN
+            + struct.pack("<H", 0)               # VER/FLAGS
+            + struct.pack("<H", 0)               # SCREEN
+            + struct.pack("<H", int(index) & 0xFFFF)
+            + struct.pack("<H", int(control) & 0xFFFF)
+            + struct.pack("<H", len(raw))
+            + raw)
+
+def build_control(red: bool, green: bool, rouge_field: str, vert_field: str) -> int:
+    """Control word : 2 bits/champ — RH=bits0-1, TT=bits2-3, LH=bits4-5."""
+    shift = {"rh": 0, "tt": 2, "lh": 4}
+    control = 0
+    if red:
+        control |= _COLOR_CODE["red"] << shift.get(rouge_field, 2)
+    if green:
+        control |= _COLOR_CODE["green"] << shift.get(vert_field, 4)
+    return control
+
 
 class _TslServer:
     """Un serveur TCP TSL pour une ligne tsl_connections."""
@@ -281,6 +349,208 @@ class _TslServer:
 
 
 # ─── Distributor ───────────────────────────────────────────────────────────────
+class _TslClient:
+    """Connexion TSL 5.0 SORTANTE (direction='out') : client TCP vers un UMD/écran
+    externe. Consomme _tally_state (réveillé par _tally_dirty, comme le distributor)
+    et émet une trame par index mappé — uniquement sur changement (anti-spam),
+    avec un rafraîchissement périodique keepalive."""
+
+    KEEPALIVE_S = 5.0
+
+    def __init__(self, conn_id, dest_host, dest_port, label_col, tally_base,
+                 rouge_field="tt", vert_field="lh"):
+        self.conn_id     = conn_id
+        self.dest_host   = dest_host
+        self.port        = dest_port
+        self.label_col   = label_col
+        self.tally_base  = tally_base
+        self.rouge_field = rouge_field
+        self.vert_field  = vert_field
+        self._stop   = threading.Event()
+        self._thread = None
+        self.running = False
+        self.clients = 0          # 1 quand connecté (même shape que _TslServer pour l'UI)
+        self.started_at = None
+        self.last_error = ""
+        self._last_sent: dict = {}   # idx → (control, text)
+
+    def start(self):
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=3)
+        self._thread = None
+        self.running = False
+
+    def _frames(self, force=False):
+        """Trames à émettre pour l'état courant (diff contre _last_sent)."""
+        from app.database import db_get_tsl_mapping, db_get_source_label_for_shm
+        with _lock:
+            state = dict(_tally_state)
+        base = int(self.tally_base or 0)
+        r_lvl = base + _OFF_FIELD.get(self.rouge_field, 2)
+        v_lvl = base + _OFF_FIELD.get(self.vert_field, 0)
+        out = []
+        try:
+            mapping = db_get_tsl_mapping(self.conn_id)
+        except Exception:
+            mapping = []
+        for m in mapping:
+            idx = int(m.get("tsl_index") or 0)
+            ref = (m.get("source_shm") or "").strip()
+            red   = state.get((idx, r_lvl), "off") != "off"
+            green = state.get((idx, v_lvl), "off") != "off"
+            control = build_control(red, green, self.rouge_field, self.vert_field)
+            try:
+                text = db_get_source_label_for_shm(ref, self.label_col) or ""
+                if not text and ref.startswith("port:"):
+                    resolved = resolve_ref(ref)
+                    if resolved:
+                        text = db_get_source_label_for_shm(resolved, self.label_col) or ""
+            except Exception:
+                text = ""
+            if force or self._last_sent.get(idx) != (control, text):
+                out.append((idx, control, text))
+                self._last_sent[idx] = (control, text)
+        return out
+
+    def _run(self):
+        while not self._stop.is_set():
+            sock = None
+            try:
+                sock = socket.create_connection((self.dest_host, int(self.port)), timeout=5)
+                sock.settimeout(5)
+                self.running, self.clients = True, 1
+                self.started_at = time.time()
+                self.last_error = ""
+                self._last_sent = {}
+                last_keepalive = 0.0
+                while not self._stop.is_set():
+                    _tally_dirty.wait(timeout=0.2)
+                    force = (time.time() - last_keepalive) >= self.KEEPALIVE_S
+                    frames = self._frames(force=force)
+                    if force:
+                        last_keepalive = time.time()
+                    for idx, control, text in frames:
+                        sock.sendall(encode_tsl_frame(idx, control, text))
+            except Exception as e:
+                self.last_error = str(e)
+            finally:
+                self.running, self.clients = False, 0
+                try:
+                    if sock:
+                        sock.close()
+                except Exception:
+                    pass
+            # reconnexion douce
+            if self._stop.wait(timeout=3):
+                break
+
+
+# ─── Publisher mixer → niveau de tally du projet (chantier 5) ─────────────────
+# Un mélangeur peut ÉMETTRE son tally (PGM=rouge, PVW=vert) sur un niveau
+# sélectionnable — défaut : le niveau du projet qui le porte. Activation par les
+# params du mixer : tally_emit (bool) + tally_level_base (int, optionnel).
+# Résolution entrée mixer → shm → PORT du projet → index (= port.ord).
+
+_mixer_pub_thr = None
+_mixer_written: dict = {}   # base → {(idx, lvl)} écrits par nous (pour purger proprement)
+
+def _mixer_field_levels(base, conns_by_base):
+    """Sous-niveaux rouge/vert pour une base : ceux de la connexion physique si elle
+    existe (cohérence avec ses consommateurs), sinon convention projet LH/RH."""
+    conn = conns_by_base.get(base)
+    if conn:
+        return (base + _OFF_FIELD.get(conn.get("rouge_field") or "tt", 2),
+                base + _OFF_FIELD.get(conn.get("vert_field") or "lh", 0))
+    return base + 0, base + 1   # LH=rouge, RH=vert (pseudo-connexion projet)
+
+def _mixer_publisher():
+    import requests as _req
+    from app.database import db_get_containers, db_get_projects, db_get_tsl_connections
+    while not _stop_evt.is_set():
+        try:
+            _mixer_publisher_tick(_req, db_get_containers, db_get_projects,
+                                  db_get_tsl_connections)
+        except Exception as e:
+            log.debug(f"TSL mixer publisher: {e}")
+        if _stop_evt.wait(timeout=0.3):
+            break
+
+def _mixer_publisher_tick(_req, db_get_containers, db_get_projects,
+                          db_get_tsl_connections):
+    from app.metrics import get_container_ip
+    projs = {p["id"]: p for p in db_get_projects()}
+    conns_by_base = {int(c.get("tally_base") or 0): c
+                     for c in db_get_tsl_connections()
+                     if c.get("enabled") and (c.get("direction") or "in") == "in"}
+    ports_by_pid = _ports_snapshot()["by_pid"]
+    changed = False
+    for ct in db_get_containers():
+        dc_raw = ct.get("deploy_config")
+        if not dc_raw:
+            continue
+        try:
+            dc = json.loads(dc_raw) if isinstance(dc_raw, str) else dc_raw
+        except Exception:
+            continue
+        if (dc.get("type") or "") != "mixer":
+            continue
+        params = dc.get("params") or {}
+        if not params.get("tally_emit"):
+            continue
+        # Niveau : sélectionnable, défaut = celui du projet du mixer.
+        base = params.get("tally_level_base")
+        pid = ct.get("project_id")
+        if base in (None, "") and pid and pid in projs:
+            base = projs[pid].get("tally_base")
+        if base in (None, ""):
+            continue
+        base = int(base)
+        try:
+            ip = get_container_ip(ct["vmid"])
+            if not ip:
+                continue
+            st = _req.get(f"http://{ip}:8082/state", timeout=0.8).json()
+        except Exception:
+            continue
+        pgm, pvw = st.get("pgm"), st.get("pvw")
+        shm_pgm = (st.get(f"input_{pgm}") or "") if pgm is not None else ""
+        shm_pvw = (st.get(f"input_{pvw}") or "") if pvw is not None else ""
+        # shm → index via les ports du projet (binding.shm == shm → ord)
+        def _idx_for(shm):
+            if not shm:
+                return None
+            for p in ports_by_pid.get(pid, []):
+                if p.get("kind") == "source" and _port_shm(p) == shm:
+                    return int(p.get("ord") or 0)
+            return None
+        r_lvl, v_lvl = _mixer_field_levels(base, conns_by_base)
+        want = {}
+        i_pgm, i_pvw = _idx_for(shm_pgm), _idx_for(shm_pvw)
+        if i_pgm is not None:
+            want[(i_pgm, r_lvl)] = "red"
+        if i_pvw is not None:
+            want[(i_pvw, v_lvl)] = "green"
+        prev = _mixer_written.get(base, {})
+        if want != prev:
+            with _lock:
+                for key in prev:
+                    if key not in want:
+                        _tally_state.pop(key, None)
+                _tally_state.update(want)
+            _mixer_written[base] = want
+            changed = True
+    if changed:
+        _tally_dirty.set()
+
+
 def _distributor():
     """Pousse tally + texte label vers chaque multiview selon sa flux_config."""
     import requests as _req
@@ -300,17 +570,59 @@ def _distributor():
 
         try:
             containers = db_get_containers()
-            # Niveau de Tally = bande tally_base : indexer les connexions actives par bande.
+            # Niveau de Tally = bande tally_base : indexer les connexions ENTRANTES
+            # actives par bande (les sortantes consomment l'état, ne le servent pas).
             conns_by_base = {int(c.get("tally_base") or 0): c
-                             for c in db_get_tsl_connections() if c.get("enabled")}
+                             for c in db_get_tsl_connections()
+                             if c.get("enabled") and (c.get("direction") or "in") == "in"}
+            for c in conns_by_base.values():
+                c["_key"] = int(c.get("id") or 0)
+            # Pseudo-connexions PAR PROJET (chantier 5) : chaque projet a son niveau de
+            # tally (tally_base) — s'il n'y a pas de connexion physique sur cette bande,
+            # une pseudo-connexion la sert (écrivain = mixer publisher). Index = ports.
+            try:
+                from app.database import db_get_projects
+                for pr in db_get_projects():
+                    tb = pr.get("tally_base")
+                    if tb is None or int(tb) in conns_by_base:
+                        continue
+                    conns_by_base[int(tb)] = {
+                        "_key": f"proj:{pr['id']}", "id": None, "tally_base": int(tb),
+                        "rouge_field": "lh", "vert_field": "rh", "_project": pr["id"],
+                    }
+            except Exception:
+                pass
             # En central l'index TSL d'un PiP est déduit de SA source : lookup inverse
-            # (connexion, source_shm) → tsl_index dans le tsl_mapping.
+            # (connexion, source_shm RÉSOLU) → tsl_index. Un mapping peut référencer
+            # "port:<id>" — résolu vers le shm bindé ; le label garde la ref d'origine.
             idx_by_conn_shm: dict = {}
+            label_ref: dict = {}      # (conn_key, shm_résolu) → ref d'origine (labels)
             for m in db_get_tsl_mappings_all():
-                shm_m = (m.get("source_shm") or "").strip()
-                if shm_m:
-                    idx_by_conn_shm[(int(m.get("connection_id") or 0), shm_m)] = \
-                        int(m.get("tsl_index") or 0)
+                ref = (m.get("source_shm") or "").strip()
+                if not ref:
+                    continue
+                shm_m = resolve_ref(ref) or ref
+                key = (int(m.get("connection_id") or 0), shm_m)
+                idx_by_conn_shm[key] = int(m.get("tsl_index") or 0)
+                if ref != shm_m:
+                    label_ref[key] = ref
+            # Ports des pseudo-connexions projet : index d'une source = son port (ord).
+            for base, c in conns_by_base.items():
+                pidc = c.get("_project")
+                if not pidc:
+                    continue
+                for p in _ports_snapshot()["by_pid"].get(pidc, []):
+                    shm_p = _port_shm(p)
+                    if shm_p:
+                        key = (c["_key"], shm_p)
+                        idx_by_conn_shm[key] = int(p.get("ord") or 0)
+                        label_ref[key] = f"port:{p['id']}"
+            # tally_base par projet (défaut de niveau des containers du projet).
+            try:
+                from app.database import db_get_projects as _dgp
+                proj_tb = {pr["id"]: pr.get("tally_base") for pr in _dgp()}
+            except Exception:
+                proj_tb = {}
         except Exception:
             continue
 
@@ -339,10 +651,15 @@ def _distributor():
                 if not isinstance(fc, dict):
                     continue
                 # Niveau de Tally (1-4) = bande tally_base ; couleurs = Rouge/Vert cochées.
+                # DÉFAUT (chantier 5) : sans niveau explicite, un container de projet
+                # utilise le niveau de tally DE SON PROJET.
                 niveau = int(fc.get("tally_level") or 0)
                 want_red   = bool(fc.get("tally_red"))
                 want_green = bool(fc.get("tally_green"))
                 want_text  = fc.get("label_source") == "protocol"
+                if not niveau and ct.get("project_id") in proj_tb \
+                        and proj_tb[ct.get("project_id")] is not None:
+                    niveau = int(proj_tb[ct.get("project_id")]) // 3 + 1
                 if not niveau or not (want_red or want_green or want_text):
                     continue
                 base = (niveau - 1) * 3
@@ -354,7 +671,8 @@ def _distributor():
                 shm = (fc.get("path") or "").strip()
                 if shm.startswith("/dev/shm/"):
                     shm = shm[len("/dev/shm/"):]
-                tsl_index = idx_by_conn_shm.get((int(conn.get("id") or 0), shm))
+                ckey = conn.get("_key", int(conn.get("id") or 0))
+                tsl_index = idx_by_conn_shm.get((ckey, shm))
                 if tsl_index is None:
                     continue
                 r_lvl  = base + _OFF.get(conn.get("rouge_field") or "tt", 2)
@@ -365,7 +683,10 @@ def _distributor():
                 color_l = "red"   if (want_red   and state.get((tsl_index, r_lvl), "off") != "off") else "off"
                 color_r = "green" if (want_green and state.get((tsl_index, v_lvl), "off") != "off") else "off"
                 try:
-                    text = db_get_source_label_for_shm(shm, label_col)
+                    lref = label_ref.get((ckey, shm))
+                    text = db_get_source_label_for_shm(lref or shm, label_col)
+                    if not text and lref:
+                        text = db_get_source_label_for_shm(shm, label_col)
                 except Exception:
                     text = ""
 
@@ -389,11 +710,16 @@ def _distributor():
                     o_text = ""
                 active = False
                 o_niveau = int(ov.get("tally_level") or 0)
+                if not o_niveau and ct.get("project_id") in proj_tb \
+                        and proj_tb[ct.get("project_id")] is not None:
+                    o_niveau = int(proj_tb[ct.get("project_id")]) // 3 + 1
                 if o_niveau and (ov.get("tally_red") or ov.get("tally_green")):
                     o_base = (o_niveau - 1) * 3
                     o_conn = conns_by_base.get(o_base)
                     if o_conn:
-                        o_idx = idx_by_conn_shm.get((int(o_conn.get("id") or 0), row_shm))
+                        row_res = resolve_ref(row_shm) or row_shm
+                        o_idx = idx_by_conn_shm.get(
+                            (o_conn.get("_key", int(o_conn.get("id") or 0)), row_res))
                         if o_idx is not None:
                             r_l = o_base + _OFF.get(o_conn.get("rouge_field") or "tt", 2)
                             v_l = o_base + _OFF.get(o_conn.get("vert_field")  or "lh", 0)
@@ -418,17 +744,19 @@ def _distributor():
 
 # ─── API publique ──────────────────────────────────────────────────────────────
 def start_all():
-    """Démarre le distributor + tous les serveurs TSL activés depuis la DB."""
-    global _dist_thr
+    """Démarre le distributor + le publisher mixer + toutes les connexions activées."""
+    global _dist_thr, _mixer_pub_thr
     stop_all()
     _stop_evt.clear()
     _tally_dirty.clear()
     _dist_thr = threading.Thread(target=_distributor, daemon=True)
     _dist_thr.start()
+    _mixer_pub_thr = threading.Thread(target=_mixer_publisher, daemon=True)
+    _mixer_pub_thr.start()
     reload()
 
 def stop_all():
-    global _dist_thr
+    global _dist_thr, _mixer_pub_thr
     _stop_evt.set()
     _tally_dirty.set()
     with _lock:
@@ -438,6 +766,9 @@ def stop_all():
     if _dist_thr and _dist_thr.is_alive():
         _dist_thr.join(timeout=3)
     _dist_thr = None
+    if _mixer_pub_thr and _mixer_pub_thr.is_alive():
+        _mixer_pub_thr.join(timeout=3)
+    _mixer_pub_thr = None
 
 def reload():
     """Synchronise _connections depuis la DB (crée/met à jour/supprime)."""
@@ -456,6 +787,14 @@ def reload():
             _connections[cid].stop()
             del _connections[cid]
 
+        def _mk(row):
+            if (row.get("direction") or "in") == "out":
+                return _TslClient(row["id"], row.get("dest_host") or "127.0.0.1",
+                                  row["port"], row["label_col"], row["tally_base"],
+                                  rouge_field=row.get("rouge_field") or "tt",
+                                  vert_field=row.get("vert_field") or "lh")
+            return _TslServer(row["id"], row["port"], row["label_col"], row["tally_base"])
+
         for row in rows:
             cid = row["id"]
             if not row["enabled"]:
@@ -464,13 +803,17 @@ def reload():
                     del _connections[cid]
                 continue
             srv = _connections.get(cid)
+            want_out = (row.get("direction") or "in") == "out"
+            is_out = isinstance(srv, _TslClient) if srv is not None else None
             if srv is None:
-                srv = _TslServer(cid, row["port"], row["label_col"], row["tally_base"])
+                srv = _mk(row)
                 _connections[cid] = srv
                 srv.start()
-            elif srv.port != row["port"] or srv.label_col != row["label_col"] or srv.tally_base != row["tally_base"]:
+            elif (srv.port != row["port"] or srv.label_col != row["label_col"]
+                  or srv.tally_base != row["tally_base"] or is_out != want_out
+                  or (want_out and getattr(srv, "dest_host", None) != (row.get("dest_host") or "127.0.0.1"))):
                 srv.stop()
-                srv2 = _TslServer(cid, row["port"], row["label_col"], row["tally_base"])
+                srv2 = _mk(row)
                 _connections[cid] = srv2
                 srv2.start()
 
