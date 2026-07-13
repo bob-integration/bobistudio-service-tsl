@@ -558,6 +558,7 @@ def _distributor():
                                db_get_setting, db_get_tsl_connections,
                                db_get_tsl_mappings_all)
     _OFF = {"lh": 0, "rh": 1, "tt": 2}
+    _last_push: dict = {}   # vmid → (dernier payload poussé, ts) — anti-repush identique (cf. plus bas)
 
     while not _stop_evt.is_set():
         _tally_dirty.wait(timeout=0.1)
@@ -730,16 +731,31 @@ def _distributor():
                 ovl.append({"id": ov.get("id"), "text": o_text, "active": active})
 
         from app.metrics import get_container_ip
+        _now_p = time.time()
         for vmid in set(updates_by_vmid) | set(overlays_by_vmid):
             try:
                 ip = get_container_ip(vmid)
                 if not ip:
                     continue
-                _req.post(f"http://{ip}:8080/tally_bulk",
-                          json={"updates": updates_by_vmid.get(vmid, []),
-                                "overlays": overlays_by_vmid.get(vmid, [])}, timeout=1)
+                payload = {"updates": updates_by_vmid.get(vmid, []),
+                           "overlays": overlays_by_vmid.get(vmid, [])}
+                # ★ PERF : ne POSTER que si l'état a RÉELLEMENT changé. Ce distributeur tourne
+                # sur un timeout de 100 ms (il repasse même sans événement TSL) : re-pousser un
+                # paquet identique 10×/s faisait re-baker l'habillage PLEIN CADRE du multiview
+                # 10×/s (PIL + RGBA→YUV + upload GPU ≈ 25 ms, soit une trame perdue à chaque
+                # fois — mur 333 Horace mesuré à 28-36 fps au lieu de 50). Le mur a lui aussi
+                # sa garde (comparaison de valeur avant de marquer sale, multiview ≥ 0.39.2) ;
+                # celle-ci évite en plus 10 requêtes HTTP/s et par mur.
+                # Re-synchro périodique (5 s) : un mur redéployé repart avec un tally VIDE — sans
+                # ce filet, il resterait éteint jusqu'au prochain changement TSL. Coût nul côté
+                # mur grâce à sa garde de valeur (paquet identique = aucun re-bake).
+                _prev, _pts = _last_push.get(vmid, (None, 0.0))
+                if _prev == payload and (_now_p - _pts) < 5.0:
+                    continue
+                _req.post(f"http://{ip}:8080/tally_bulk", json=payload, timeout=1)
+                _last_push[vmid] = (payload, _now_p)
             except Exception:
-                pass
+                _last_push.pop(vmid, None)   # échec → re-pousser au prochain tour
 
 
 # ─── API publique ──────────────────────────────────────────────────────────────
