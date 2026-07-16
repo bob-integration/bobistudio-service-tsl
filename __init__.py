@@ -839,6 +839,75 @@ def get_tally_state() -> dict:
 
 
 # ─── Actions de service (chantier 6 — macros/shotbox) ─────────────────────────
+def _ref_options(pid=None):
+    """Sources labellisables : ports SOURCE + shms produits par les containers (bornés au
+    projet si `pid`, sinon toute la flotte). {value, label} pour un menu déroulant."""
+    out, seen = [], set()
+    snap = _ports_snapshot()
+    ports = snap["by_pid"].get(pid, []) if pid else list(snap["by_id"].values())
+    for p in ports:
+        if (p.get("kind") or "") != "source":
+            continue
+        val = f"port:{p['id']}"
+        if val in seen:
+            continue
+        seen.add(val)
+        out.append({"value": val, "label": p.get("name") or f"Port {p['id']}"})
+    try:
+        from app.database import db_get_containers
+        from app.auth import vmid_project_ids
+        from app import plugins as _plugins
+        for c in db_get_containers():
+            if pid and pid not in vmid_project_ids(c["vmid"]):
+                continue
+            dc = c.get("deploy_config")
+            dc = json.loads(dc) if isinstance(dc, str) else (dc or {})
+            t, prm = dc.get("type"), (dc.get("params") or {})
+            if not _plugins.is_plugin(t):
+                continue
+            hn = prm.get("hostname") or c.get("hostname") or ""
+            try:
+                for pr in _plugins.derive_wiring(t, hn, prm)["produces"]:
+                    shm = pr.get("shm")
+                    if not shm or shm in seen:
+                        continue
+                    seen.add(shm)
+                    lbl = (pr.get("label") or "").strip()
+                    # Sans label propre, retomber sur le shm (les N sorties d'un moteur
+                    # partagent le hostname → « hn » seul serait ambigu).
+                    out.append({"value": shm, "label": (hn + " · " + lbl) if lbl else shm})
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return out
+
+
+def action_options(action_id, key, pid=None):
+    """Options dynamiques des params d'action TSL (menus déroulants au lieu de champs
+    libres). `set_label.ref` → sources ; `set_label.col` → colonnes 2-9 avec leur nom
+    (setting `tsl_label_names`). `pid` borne la liste de sources au projet."""
+    if action_id != "set_label":
+        return []
+    if key == "ref":
+        return _ref_options(pid)
+    if key == "col":
+        from app.database import db_get_setting
+        names = db_get_setting("tsl_label_names", None)
+        if isinstance(names, str):
+            try:
+                names = json.loads(names)
+            except Exception:
+                names = None
+        names = names if isinstance(names, list) else []
+        out = []
+        for i in range(2, 10):
+            nm = names[i] if i < len(names) and names[i] else f"Label {i}"
+            out.append({"value": i, "label": f"{i} — {nm}"})
+        return out
+    return []
+
+
 def run_action(action_id, params, ctx):
     """`tsl.set_label(ref, col, text)` : écrit une colonne de label d'une source.
     En contexte PROJET (ctx.project_id), la cible est BORNÉE aux refs du projet :

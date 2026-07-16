@@ -33,14 +33,16 @@
       "params": [
         {
           "key": "ref",
-          "label": "Source (shm ou port)",
-          "type": "text"
+          "label": "Source",
+          "type": "text",
+          "options_hook": true
         },
         {
           "key": "col",
-          "label": "Colonne (2-9)",
+          "label": "Colonne",
           "type": "number",
-          "default": 2
+          "default": 2,
+          "options_hook": true
         },
         {
           "key": "text",
