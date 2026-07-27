@@ -1,7 +1,10 @@
 {
-  "version": "0.2.1",
-  "published_at": "2026-06-30",
+  "version": "0.2.2",
+  "published_at": "2026-07-27",
   "changes": {
+    "Mapping TSL : sources au niveau de libellé courant (0.2.2)": [
+      "Le sélecteur « source » du mapping index TSL → source affiche le libellé d'exploitation du niveau choisi dans la barre de navigation devant le nom technique (window.SourceLabels). On mappe un index sur une source qu'on reconnaît."
+    ],
     "Nouveautés": [
       "Mapping index→source éditable au tableur (page Labels) : une colonne d'index TSL par connexion, avec auto-incrément/recopie, copier-coller et détection de doublons — alternative au panneau « Mapping » par connexion",
       "Temps réel (≥2 Hz) : page Protocoles (état tally + statut/dernier changement des connexions, maj en place sans écraser les champs) et tableur Labels (pastille de tally live LH/RH/TT par cellule d'index) rafraîchis toutes les 400 ms pour le debug tally/UMD",

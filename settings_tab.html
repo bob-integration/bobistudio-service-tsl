@@ -365,7 +365,11 @@ function _tslMapRender() {
 
     const known = new Set(_tslMapSources.map(s => s.shm));
     const shmOpts = '<option value="">— aucune —</option>' + _tslMapSources.map(s =>
-        `<option value="${escapeHtml(s.shm)}">${escapeHtml(s.hostname||s.shm)} → ${escapeHtml(s.shm)}</option>`
+        // Libellé d'exploitation devant le nom technique (niveau choisi dans la barre de
+        // navigation) : on mappe un index TSL sur une source qu'on reconnaît.
+        `<option value="${escapeHtml(s.shm)}">${escapeHtml(
+            window.SourceLabels ? window.SourceLabels.display(s.shm, (s.hostname||s.shm) + ' → ' + s.shm)
+                                : (s.hostname||s.shm) + ' → ' + s.shm)}</option>`
     ).join('');
 
     tbody.innerHTML = _tslMapRows.map((m, i) => {

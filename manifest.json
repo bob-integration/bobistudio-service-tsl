@@ -22,7 +22,7 @@
       ]
     }
   },
-  "version": "0.2.1",
+  "version": "0.2.2",
   "order": 4,
   "description": "Service TSL 5.0 centralisé — multi-connexions, 10 niveaux tally (LH/RH/TT par connexion), 10 colonnes labels par source. Distribution automatique vers les multiviews.",
   "actions": [
