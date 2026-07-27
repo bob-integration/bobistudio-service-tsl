@@ -1106,6 +1106,31 @@ def register_routes(bp):
     def tsl_mapping_for_conn(cid):
         return jsonify(db_get_tsl_mapping(cid))
 
+    @bp.route("/api/tsl/mapping/by_shm", methods=["GET"])
+    @require_login
+    def tsl_mapping_by_shm():
+        """Inverse du mapping : {shm: [{connection_id, name, tsl_index, levels}]}.
+
+        Sans ça, une UI ne peut PAS afficher le tally d'une source : le mapping est stocké par
+        (connexion, index) → shm, et rien ne permettait de faire le chemin retour. `by_shm` ne
+        renvoie que les LIBELLÉS, pas d'index — la page Câbles lisait donc `src.tsl_index` sur un
+        objet qui n'a jamais eu ce champ, et ses pastilles de tally ne se sont jamais allumées.
+
+        `levels` = les trois niveaux alloués à la connexion (LH=base, RH=base+1, TT=base+2) : deux
+        connexions peuvent employer le MÊME index pour des sources différentes, l'index seul ne
+        suffit donc pas à décider si une lampe nous concerne."""
+        out = {}
+        for c in db_get_tsl_connections():
+            base = int(c.get("tally_base") or 0)
+            for m in db_get_tsl_mapping(c["id"]):
+                shm = (m.get("source_shm") or "").strip()
+                if not shm:
+                    continue
+                out.setdefault(shm, []).append({
+                    "connection_id": c["id"], "name": c.get("name") or "",
+                    "tsl_index": m["tsl_index"], "levels": [base, base + 1, base + 2]})
+        return jsonify(out)
+
     @bp.route("/api/tsl/mapping/<int:cid>/<int:idx>", methods=["POST", "PUT"])
     @require_perm("settings.edit")
     def tsl_mapping_upsert(cid, idx):
