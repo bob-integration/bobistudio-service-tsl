@@ -15,6 +15,7 @@ Protocole TSL 5.0 (offsets vérifiés sur le fil VSM, capture 2026-06-30) :
 INDEX = display index (la source). CONTROL bits : 0-1=RH, 2-3=TT, 4-5=LH (0=off 1=red 2=green 3=amber)
 """
 import json
+from app.numerotation import cle_input
 import logging
 import socket
 import struct
@@ -521,8 +522,8 @@ def _mixer_publisher_tick(_req, db_get_containers, db_get_projects,
         except Exception:
             continue
         pgm, pvw = st.get("pgm"), st.get("pvw")
-        shm_pgm = (st.get(f"input_{pgm}") or "") if pgm is not None else ""
-        shm_pvw = (st.get(f"input_{pvw}") or "") if pvw is not None else ""
+        shm_pgm = (st.get(cle_input(pgm)) or "") if pgm is not None else ""
+        shm_pvw = (st.get(cle_input(pvw)) or "") if pvw is not None else ""
         # shm → index via les ports du projet (binding.shm == shm → ord)
         def _idx_for(shm):
             if not shm:
