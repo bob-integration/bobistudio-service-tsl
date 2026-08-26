@@ -1,24 +1,24 @@
+<script>
+// i18n (catalogue service.tsl.*) — repli sur le français passé en 2e argument.
+const _tslT = (k, repli) => { const v = window.t ? window.t(k) : k; return (v && v !== k) ? v : repli; };
+</script>
 <div id="protocoles-tab-tsl" class="set-tab-content" style="display:none">
 
     <!-- ─── Connexions ─────────────────────────────────────────────────────── -->
-    <h2>Connexions TSL 5.0</h2>
+    <h2>{{ _('service.tsl.connexions_tsl_5_0') }}</h2>
     <div class="form">
-        <div class="meta" style="margin-bottom:var(--space-3)">
-            Chaque connexion ouvre un serveur TCP sur son port. Le champ <em>Texte TSL</em> reçu
-            automatiquement met à jour la colonne label désignée. Les niveaux tally LH/RH/TT de
-            cette connexion sont affectés aux niveaux globaux à partir de <em>Tally base</em>.
-        </div>
+        <div class="meta" style="margin-bottom:var(--space-3)">{{ _('service.tsl.chaque_connexion_ouvre_un_serveur_tcp_su')|safe }}</div>
         <table id="tsl_conn_table" style="width:100%;border-collapse:collapse;font-size:0.84em;margin-bottom:var(--space-3)">
             <thead>
                 <tr style="color:var(--text-muted);text-align:left;border-bottom:1px solid var(--border)">
-                    <th style="padding:var(--space-1) var(--space-2)">Nom</th>
-                    <th style="padding:var(--space-1) var(--space-2)">Sens / Cible</th>
-                    <th style="padding:var(--space-1) var(--space-2)">Port TCP</th>
-                    <th style="padding:var(--space-1) var(--space-2)">Actif</th>
-                    <th style="padding:var(--space-1) var(--space-2)">Colonne label</th>
-                    <th style="padding:var(--space-1) var(--space-2)">Niveau de Tally</th>
-                    <th style="padding:var(--space-1) var(--space-2)">Rouge / Vert</th>
-                    <th style="padding:var(--space-1) var(--space-2)">Statut</th>
+                    <th style="padding:var(--space-1) var(--space-2)">{{ _('service.tsl.nom') }}</th>
+                    <th style="padding:var(--space-1) var(--space-2)">{{ _('service.tsl.sens_cible') }}</th>
+                    <th style="padding:var(--space-1) var(--space-2)">{{ _('service.tsl.port_tcp') }}</th>
+                    <th style="padding:var(--space-1) var(--space-2)">{{ _('service.tsl.actif') }}</th>
+                    <th style="padding:var(--space-1) var(--space-2)">{{ _('service.tsl.colonne_label') }}</th>
+                    <th style="padding:var(--space-1) var(--space-2)">{{ _('service.tsl.niveau_de_tally') }}</th>
+                    <th style="padding:var(--space-1) var(--space-2)">{{ _('service.tsl.rouge_vert') }}</th>
+                    <th style="padding:var(--space-1) var(--space-2)">{{ _('service.tsl.statut') }}</th>
                     <th style="padding:var(--space-1) var(--space-2)"></th>
                 </tr>
             </thead>
@@ -27,38 +27,29 @@
             </tbody>
         </table>
         <div style="display:flex;gap:var(--space-3)">
-            <button class="btn" onclick="tslConnAdd()">+ Ajouter une connexion</button>
+            <button class="btn" onclick="tslConnAdd()">{{ _('service.tsl.ajouter_une_connexion') }}</button>
         </div>
     </div>
 
     <!-- ─── Sources ────────────────────────────────────────────────────────── -->
-    <h2>Sources TSL</h2>
+    <h2>{{ _('service.tsl.sources_tsl') }}</h2>
     <div class="form">
-        <div class="meta" style="margin-bottom:var(--space-3)">
-            Gestion avancée des sources : tri par colonne, filtres, sélection multi-cellules et
-            auto-incrément (style tableur). <strong>Le mapping index TSL → source s'y édite
-            désormais directement</strong> : une colonne d'index par connexion (recopie/auto-incrément
-            pour numéroter en masse). Le panneau « Mapping » ci-dessous reste une vue par connexion.
-        </div>
+        <div class="meta" style="margin-bottom:var(--space-3)">{{ _('service.tsl.gestion_avancee_des_sources_tri_par_colo')|safe }}</div>
         <div style="display:flex;align-items:center;gap:var(--space-3)">
-            <a href="/labels" class="btn btn-blue">Ouvrir l'éditeur de labels →</a>
+            <a href="/labels" class="btn btn-blue">{{ _('service.tsl.ouvrir_l_editeur_de_labels') }}</a>
             <span id="tsl_src_summary" class="meta">—</span>
         </div>
     </div>
 
     <!-- ─── Mapping indices ──────────────────────────────────────────────────── -->
     <div id="tsl_mapping_panel" style="display:none">
-        <h2 id="tsl_mapping_title">Mapping indices — connexion</h2>
+        <h2 id="tsl_mapping_title">{{ _('service.tsl.mapping_indices_connexion') }}</h2>
         <div class="form">
-            <div class="meta" style="margin-bottom:var(--space-3)">
-                Association <em>index TSL → source (shm)</em> pour cette connexion.
-                Quand un paquet TSL est reçu avec cet index, la colonne label désignée
-                de la source correspondante est mise à jour.
-            </div>
+            <div class="meta" style="margin-bottom:var(--space-3)">{{ _('service.tsl.association_index_tsl_source_shm_pour_ce')|safe }}</div>
             <table id="tsl_map_table" style="width:100%;border-collapse:collapse;font-size:0.84em;margin-bottom:var(--space-3)">
                 <thead>
                     <tr style="color:var(--text-muted);text-align:left;border-bottom:1px solid var(--border)">
-                        <th style="padding:var(--space-1) var(--space-2)">Index TSL</th>
+                        <th style="padding:var(--space-1) var(--space-2)">{{ _('service.tsl.index_tsl') }}</th>
                         <th style="padding:var(--space-1) var(--space-2)">Source (shm)</th>
                         <th style="padding:var(--space-1) var(--space-2)"></th>
                     </tr>
@@ -68,22 +59,16 @@
                 </tbody>
             </table>
             <div style="display:flex;gap:var(--space-3)">
-                <button class="btn" onclick="tslMappingAddRow()">+ Ajouter un index</button>
-                <button class="btn" onclick="tslMappingClose()">Fermer</button>
+                <button class="btn" onclick="tslMappingAddRow()">{{ _('service.tsl.ajouter_un_index') }}</button>
+                <button class="btn" onclick="tslMappingClose()">{{ _('service.tsl.fermer') }}</button>
             </div>
         </div>
     </div>
 
     <!-- ─── État tally ─────────────────────────────────────────────────────── -->
-    <h2>État tally courant</h2>
+    <h2>{{ _('service.tsl.etat_tally_courant') }}</h2>
     <div class="form">
-        <div class="meta" style="margin-bottom:var(--space-3)">
-            Tous les tallies actuellement actifs, regroupés par connexion (= niveau de Tally).
-            <strong>IDX</strong> = index TSL envoyé par le contrôleur (le numéro de source).
-            <strong>Rouge</strong> et <strong>Vert</strong> sont les champs définis par connexion
-            (colonne « Rouge / Vert » ci-dessus) ; la source associée (si mappée) est rappelée
-            à côté de l'index.
-        </div>
+        <div class="meta" style="margin-bottom:var(--space-3)">{{ _('service.tsl.tous_les_tallies_actuellement_actifs_reg')|safe }}</div>
         <div id="tsl_tally_state" class="meta">—</div>
     </div>
 
@@ -129,14 +114,15 @@ function _tslRenderSrcSummary() {
     const el = document.getElementById('tsl_src_summary');
     if (!el) return;
     const n = _tslSources.length;
-    el.textContent = n ? `${n} source${n > 1 ? 's' : ''} enregistrée${n > 1 ? 's' : ''}` : 'Aucune source enregistrée';
+    el.textContent = n ? _tslT('service.tsl.js.n_sources','{n} source(s) enregistrée(s)').replace('{n}', n)
+                       : _tslT('service.tsl.js.no_source','Aucune source enregistrée');
 }
 
 // ── Connexions ──────────────────────────────────────────────────────────────
 // Statut + dernier changement (extrait : réutilisé pour la mise à jour live en place)
 function _tslConnStatusHtml(c) {
     const st = c.status || {};
-    const statusTxt = st.running ? `<span style="color:var(--status-running-fg)">Actif</span> · ${st.clients ?? 0} client(s)${st.uptime ? ' · ' + st.uptime : ''}`
+    const statusTxt = st.running ? `<span style="color:var(--status-running-fg)">{{ _('service.tsl.actif') }}</span> · ${st.clients ?? 0} client(s)${st.uptime ? ' · ' + st.uptime : ''}`
                     : (st.error  ? `<span style="color:var(--status-stopped-fg)">${escapeHtml(st.error)}</span>`
                                  : `<span style="color:var(--text-muted)">Inactif</span>`);
     const DOT = { red: '#cc2222', green: '#22aa44', amber: '#cc8800', off: '#555' };
@@ -249,15 +235,15 @@ async function tslConnSave(cid) {
     const url    = cid ? `/api/tsl/connections/${cid}` : '/api/tsl/connections';
     const method = cid ? 'PUT' : 'POST';
     const r = await fetch(url, { method, headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) });
-    if (r.ok) { mxlToast('Connexion enregistrée', 'success'); await rafraichirTsl(); }
-    else       { mxlToast('Erreur sauvegarde connexion', 'error'); }
+    if (r.ok) { mxlToast(_tslT('service.tsl.js.conn_saved','Connexion enregistrée'), 'success'); await rafraichirTsl(); }
+    else       { mxlToast(_tslT('service.tsl.js.conn_save_err','Erreur sauvegarde connexion'), 'error'); }
 }
 
 async function tslConnDel(cid) {
-    if (!confirm('Supprimer cette connexion TSL ?')) return;
+    if (!confirm(_tslT('service.tsl.conn_del_confirm','Supprimer cette connexion TSL ?'))) return;
     const r = await fetch(`/api/tsl/connections/${cid}`, { method: 'DELETE' });
-    if (r.ok) { mxlToast('Connexion supprimée', 'success'); await rafraichirTsl(); }
-    else       { mxlToast('Erreur suppression', 'error'); }
+    if (r.ok) { mxlToast(_tslT('service.tsl.js.conn_deleted','Connexion supprimée'), 'success'); await rafraichirTsl(); }
+    else       { mxlToast(_tslT('service.tsl.js.del_err','Erreur suppression'), 'error'); }
 }
 
 // ── État tally ────────────────────────────────────────────────────────────────
@@ -414,17 +400,17 @@ async function tslMappingSave(i) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ source_shm: shm })
     });
-    if (r.ok) { mxlToast('Mapping enregistré', 'success'); await _tslMapLoad(); }
-    else       mxlToast('Erreur sauvegarde mapping', 'error');
+    if (r.ok) { mxlToast(_tslT('service.tsl.js.map_saved','Mapping enregistré'), 'success'); await _tslMapLoad(); }
+    else       mxlToast(_tslT('service.tsl.js.map_save_err','Erreur sauvegarde mapping'), 'error');
 }
 
 async function tslMappingDel(i, idx) {
     if (!_tslActiveCid) return;
     if (_tslMapRows[i]?._new) { _tslMapRows.splice(i, 1); _tslMapRender(); return; }
-    if (!confirm(`Supprimer le mapping index ${idx} ?`)) return;
+    if (!confirm(_tslT('service.tsl.map_del_confirm','Supprimer le mapping index {idx} ?').replace('{idx}', idx))) return;
     const r = await fetch(`/api/tsl/mapping/${_tslActiveCid}/${idx}`, { method: 'DELETE' });
-    if (r.ok) { mxlToast('Mapping supprimé', 'success'); await _tslMapLoad(); }
-    else       mxlToast('Erreur suppression mapping', 'error');
+    if (r.ok) { mxlToast(_tslT('service.tsl.js.map_deleted','Mapping supprimé'), 'success'); await _tslMapLoad(); }
+    else       mxlToast(_tslT('service.tsl.js.map_del_err','Erreur suppression mapping'), 'error');
 }
 
 // ── Rafraîchissement live (≥2 Hz) — uniquement quand l'onglet TSL est visible ──
