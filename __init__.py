@@ -638,7 +638,65 @@ def _distributor():
                 dc = json.loads(dc_raw) if isinstance(dc_raw, str) else dc_raw
             except Exception:
                 continue
-            if (dc.get("type") or "") != "multiview":
+            type_ct = (dc.get("type") or "")
+            if type_ct != "multiview":
+                # ── AUTRES PLUGINS : le plugin DIT ce qu'il veut voir allumé ──────────────
+                # ★ UN HOOK, PAS UNE BRANCHE PAR TYPE. Le distributeur connaissait un seul
+                # modèle de données (`flux_config` du mur) ; chaque plugin qui voudrait du
+                # tally aurait ajouté ici sa propre lecture, et ce fichier serait devenu un
+                # catalogue de modèles étrangers. Le plugin déclare `tally_targets` et rend
+                # une liste plate : le distributeur ne sait plus rien de personne.
+                #
+                # ⚠ LE MUR RESTE SUR SON CHEMIN. C'est le plus sensible du produit et il
+                # tourne : on ne le fait pas passer sur du code neuf pour l'élégance.
+                try:
+                    from app import plugins as _plug
+                    _h = _plug.get_hook(type_ct, "tally_targets")
+                except Exception:
+                    _h = None
+                if not _h:
+                    continue
+                try:
+                    cibles = _h(dc.get("params") or {},
+                                {"vmid": ct["vmid"], "project_id": ct.get("project_id")}) or []
+                except Exception:
+                    continue
+                for cible in cibles:
+                    if not isinstance(cible, dict):
+                        continue
+                    shm_c = (cible.get("shm") or "").strip()
+                    if shm_c.startswith("/dev/shm/"):
+                        shm_c = shm_c[len("/dev/shm/"):]
+                    if not shm_c:
+                        continue
+                    niv = int(cible.get("niveau") or 0)
+                    if not niv and ct.get("project_id") in proj_tb \
+                            and proj_tb[ct.get("project_id")] is not None:
+                        niv = int(proj_tb[ct.get("project_id")]) // 3 + 1
+                    conn_c = conns_by_base.get((niv - 1) * 3) if niv else None
+                    b_c = (niv - 1) * 3 if niv else 0
+                    # LE TEXTE EST RÉSOLU MÊME SANS NIVEAU DE TALLY. Un scope peut vouloir le
+                    # libellé vivant d'une source sans jamais l'allumer en rouge — et c'est
+                    # même le cas courant : un instrument n'est pas à l'antenne.
+                    try:
+                        txt_c = db_get_source_label_for_shm(
+                            shm_c, int(cible.get("label_col") or 0))
+                    except Exception:
+                        txt_c = ""
+                    coul_r = coul_v = "off"
+                    if conn_c:
+                        ck_c = conn_c.get("_key", int(conn_c.get("id") or 0))
+                        ti = idx_by_conn_shm.get((ck_c, shm_c))
+                        if ti is not None:
+                            rl = b_c + _OFF.get(conn_c.get("rouge_field") or "tt", 2)
+                            vl = b_c + _OFF.get(conn_c.get("vert_field") or "lh", 0)
+                            if state.get((ti, rl), "off") != "off":
+                                coul_r = "red"
+                            if state.get((ti, vl), "off") != "off":
+                                coul_v = "green"
+                    updates_by_vmid.setdefault(ct["vmid"], []).append(
+                        {"cle": str(cible.get("cle") or shm_c), "shm": shm_c,
+                         "rouge": coul_r, "vert": coul_v, "texte": txt_c})
                 continue
             params = dc.get("params") or {}
             # Mode Direct : le multiview reçoit le TSL via son serveur local → ne pas double-piloter.
