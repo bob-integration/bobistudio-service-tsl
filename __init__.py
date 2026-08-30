@@ -1038,7 +1038,28 @@ def is_running():
         return any(srv.running for srv in _connections.values())
 
 def status_dict() -> dict:
-    """Retour agrégé pour compatibilité."""
+    """Retour agrégé pour compatibilité.
+
+    ★ L'ACTIVATION DE TSL EST PAR CONNEXION, PAS GLOBALE. Il n'y a plus de réglage
+    `tsl_enabled` — il ne survit que pour la migration dans `init_db`. Chaque
+    entrée de la table `tsl_connections` porte son propre `enabled` et son propre
+    port. La page Services, qui cherchait une clé `*_enabled` dans le manifeste,
+    n'en trouvait aucune et affichait « — » : un service avec deux ports TCP en
+    écoute passait donc pour non activé.
+
+    On publie donc `enabled` nous-mêmes — vrai dès qu'une connexion est activée —
+    et l'agrégateur préfère ce que le service DIT à ce qu'un réglage laisse
+    supposer. C'est la même règle que partout ailleurs : l'observé prime sur le
+    déclaratif."""
+    try:
+        from app.database import get_db
+        # Pas de close() : la connexion est thread-locale et partagée.
+        lignes = get_db().execute(
+            "SELECT enabled, port FROM tsl_connections").fetchall()
+        n_tot = len(lignes)
+        actives = [r["port"] for r in lignes if r["enabled"]]
+    except Exception:
+        n_tot, actives = 0, []
     with _lock:
         running = any(s.running for s in _connections.values())
         clients = sum(s.clients for s in _connections.values())
@@ -1048,6 +1069,10 @@ def status_dict() -> dict:
         errors = [s.last_error for s in _connections.values() if s.last_error]
         return {
             "running":        running,
+            "enabled":        bool(actives),
+            "connexions":     n_tot,
+            "connexions_actives": len(actives),
+            "ports":          actives,
             "clients":        clients,
             "uptime":         None,
             "last_pkt_ago_s": last_ago,
