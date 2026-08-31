@@ -39,7 +39,22 @@ _lock       = threading.Lock()
 _dist_thr   = None
 _stop_evt   = threading.Event()
 
-# {(tsl_index: int, level: int): "off"|"red"|"green"|"amber"}
+# ═══ L'ÉTAT DU TALLY, EN DEUX COUCHES ═════════════════════════════════════════════════════════
+#
+# ★ PLUSIEURS SOURCES PEUVENT SERVIR LE MÊME NIVEAU, et c'est un cas voulu : deux contrôleurs
+# broadcast sur une même chaîne de destination, un émetteur TSL doublé par un Receiver IS-07, un
+# mélangeur qui complète ce qu'un pupitre externe annonce. Une seule couche ne pouvait pas
+# l'exprimer : le dernier écrivain écrasait les autres, et surtout, une source qui repasse au vert
+# écrivait « off » sur le rouge d'une AUTRE — un tally qui s'éteint sans que personne ne l'ait
+# demandé, sur une fonction d'antenne.
+#
+#   `_tally_par_source[(index, niveau)][source]` — ce que CHAQUE source affirme. Une source
+#   remplace toujours sa contribution ENTIÈRE (`poser_tally`), jamais case par case : sinon un
+#   signal qui sort du programme garderait son rouge, faute d'un « off » explicite.
+#
+#   `_tally_state[(index, niveau)]` — le CUMUL, seul lu par les consommateurs. Rouge + vert donne
+#   l'ambre, exactement comme deux contributions d'un même mélangeur.
+_tally_par_source: dict = {}
 _tally_state: dict = {}
 _tally_dirty = threading.Event()
 
@@ -243,13 +258,11 @@ class _TslServer:
                 colors = {self.niveau: ("amber" if rouge and vert else
                                         "red" if rouge else "green" if vert else "off")}
 
-        changed = False
-        with _lock:
-            for lvl, color in colors.items():
-                key = (index, lvl)
-                if _tally_state.get(key) != color:
-                    _tally_state[key] = color
-                    changed = True
+        # La contribution de CE serveur pour CET index. On ne remplace pas sa contribution
+        # entière (les autres index qu'il tallye restent), mais bien sa case à lui : un serveur
+        # TSL reçoit ses index un par un, chaque trame ne parlant que d'un seul.
+        changed = _poser_cases("tsl:%s" % self.conn_id,
+                               {(index, lvl): color for lvl, color in colors.items()})
         if changed:
             _tally_dirty.set()
             with self._lock:
@@ -483,7 +496,6 @@ class _TslClient:
 # Résolution entrée mixer → shm → PORT du projet → index (= port.ord).
 
 _mixer_pub_thr = None
-_mixer_written: dict = {}   # niveaux → {(idx, lvl)} écrits par nous (pour purger proprement)
 # Dernier `/state` connu de chaque mélangeur, DÉPOSÉ par l'émetteur qui l'interroge déjà toutes
 # les 0,3 s. La propagation le relit : refaire la requête depuis le distributeur doublerait le
 # trafic vers les conteneurs pour la même information, à la même fraîcheur.
@@ -637,15 +649,10 @@ def _mixer_publisher_tick(_req, db_get_containers, db_get_projects,
                 _poser(i_pgm, "red")
             if i_pvw is not None:
                 _poser(i_pvw, "green")
-        cle_ecrit = tuple(niveaux)
-        prev = _mixer_written.get(cle_ecrit, {})
-        if want != prev:
-            with _lock:
-                for key in prev:
-                    if key not in want:
-                        _tally_state.pop(key, None)
-                _tally_state.update(want)
-            _mixer_written[cle_ecrit] = want
+        # ★ REMPLACEMENT INTÉGRAL, PAR MÉLANGEUR. `poser_tally` retire tout ce que CE mélangeur
+        # avait posé et qu'il ne pose plus — un changement de PGM éteint donc l'ancienne source —
+        # sans jamais toucher à ce qu'un autre écrivain affirme sur les mêmes clés.
+        if poser_tally("mixer:%s" % ct["vmid"], want, reveiller=False):
             changed = True
     if changed:
         _tally_dirty.set()
@@ -1170,6 +1177,76 @@ def reload():
                 srv2 = _mk(row)
                 _connections[cid] = srv2
                 srv2.start()
+
+def _cumul_des_sources(cle):
+    """Couleur résultante d'une case, tous écrivains confondus. À appeler SOUS `_lock`."""
+    couleur = "off"
+    for c in (_tally_par_source.get(cle) or {}).values():
+        couleur = cumuler(couleur, c)
+    return couleur
+
+
+def _poser_cases(source, cases):
+    """Pose/actualise les cases nommées pour cette source, sans toucher aux autres. Sous `_lock`
+    en interne ; renvoie True si le CUMUL a bougé quelque part."""
+    change = False
+    with _lock:
+        for cle, couleur in (cases or {}).items():
+            par = _tally_par_source.setdefault(cle, {})
+            if couleur == "off":
+                if par.pop(source, None) is None:
+                    continue
+            elif par.get(source) == couleur:
+                continue
+            else:
+                par[source] = couleur
+            neuf = _cumul_des_sources(cle)
+            if not par:
+                _tally_par_source.pop(cle, None)
+            if _tally_state.get(cle, "off") != neuf:
+                if neuf == "off":
+                    _tally_state.pop(cle, None)
+                else:
+                    _tally_state[cle] = neuf
+                change = True
+    return change
+
+
+def poser_tally(source, cases, reveiller=True):
+    """Remplace la contribution ENTIÈRE de `source`. Renvoie True si le cumul a bougé.
+
+    ★ ENTIÈRE, ET C'EST LE POINT. Un écrivain qui ne poserait que ses cases allumées ne pourrait
+    jamais en éteindre une : la source qui sort du programme garderait son rouge indéfiniment,
+    faute d'un « off » explicite. On retire donc d'abord tout ce que cette source affirmait et
+    qu'elle n'affirme plus — sans toucher à ce que les AUTRES affirment sur les mêmes cases.
+
+    `source` est une chaîne qui identifie l'écrivain : `tsl:<id>`, `mixer:<vmid>`,
+    `is07:<receiver>`. Deux écrivains sur le même niveau se CUMULENT (rouge + vert = ambre) au
+    lieu de s'écraser."""
+    cases = {k: v for k, v in (cases or {}).items() if v and v != "off"}
+    change = False
+    with _lock:
+        # ⚠ CE FILTRE EST UNE OPTIMISATION, PAS LE GARDE-FOU. Ce qui protège les autres écrivains,
+        # c'est le `par.pop(source)` de `_poser_cases` : retirer sa propre entrée d'une case ne
+        # touche à rien d'autre. Vérifié par mutation — élargir cette liste à toutes les cases ne
+        # change aucun résultat. Ne pas la « corriger » en croyant renforcer quelque chose.
+        anciennes = [cle for cle, par in _tally_par_source.items() if source in par]
+    a_retirer = {cle: "off" for cle in anciennes if cle not in cases}
+    if a_retirer:
+        change = _poser_cases(source, a_retirer) or change
+    change = _poser_cases(source, cases) or change
+    if change and reveiller:
+        _tally_dirty.set()
+    return change
+
+
+def sources_du_tally() -> dict:
+    """`{"<index>_<niveau>": {source: couleur}}` — QUI affirme quoi. Sert au diagnostic : sans
+    ça, un niveau servi par deux écrivains ne dit pas lequel allume la lampe."""
+    with _lock:
+        return {f"{idx}_{lvl}": dict(par)
+                for (idx, lvl), par in _tally_par_source.items() if par}
+
 
 def get_tally_state() -> dict:
     with _lock:
