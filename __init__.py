@@ -6,7 +6,9 @@
 """Service TSL 5.0 centralisé — multi-connexions, 10 niveaux tally, 10 colonnes labels.
 
 Chaque connexion TSL (tsl_connections DB) ouvre son propre serveur TCP.
-Le tally est stocké par (index, niveau) où niveau = tally_base + {0=LH, 1=RH, 2=TT}.
+Le tally est stocké par (index, niveau), où `niveau` est un identifiant de `tally_levels` —
+une ENTITÉ nommée, pas un décalage. TSL projette ses trois champs (LH/RH/TT) sur trois niveaux
+affectés par connexion : le « 3 » est la trame de TSL, il ne structure plus le modèle.
 Le distributor lit les deploy_config des multiviews et envoie color + text par fenêtre.
 
 Protocole TSL 5.0 (offsets vérifiés sur le fil VSM, capture 2026-06-30) :
@@ -120,11 +122,18 @@ def build_control(red: bool, green: bool, rouge_field: str, vert_field: str) -> 
 class _TslServer:
     """Un serveur TCP TSL pour une ligne tsl_connections."""
 
-    def __init__(self, conn_id, port, label_col, tally_base):
+    def __init__(self, conn_id, port, label_col, niveaux):
+        """`niveaux` = {"lh": id, "rh": id, "tt": id} — les trois niveaux que CETTE connexion
+        alimente par ses trois champs.
+
+        ★ Plus de base historique. Le mot de contrôle TSL 5.0 réserve deux bits par champ, pour trois
+        champs : c'est SA trame, et elle reste ici. Ce qui a disparu, c'est que ce « 3 » structure
+        le modèle interne — une production n'est plus plafonnée à trois chaînes de destination
+        parce que TSL en a trois."""
         self.conn_id    = conn_id
         self.port       = port
         self.label_col  = label_col    # colonne label mise à jour par TSL text
-        self.tally_base = tally_base   # LH=base, RH=base+1, TT=base+2
+        self.niveaux    = dict(niveaux or {})
         self._stop      = threading.Event()
         self._thread    = None
         self._lock      = threading.Lock()
@@ -216,11 +225,10 @@ class _TslServer:
                 if has_green: return "green"
                 return "off"
 
-            colors = {
-                self.tally_base:     _tsl_color(lh_v),   # LH
-                self.tally_base + 1: _tsl_color(rh_v),   # RH
-                self.tally_base + 2: _tsl_color(tt_v),   # TT
-            }
+            # Un champ dont le niveau n'est pas affecté n'écrit RIEN — plutôt que d'écrire
+            # sur un niveau deviné, ce qui allumerait un rouge chez quelqu'un d'autre.
+            par_champ = {"lh": _tsl_color(lh_v), "rh": _tsl_color(rh_v), "tt": _tsl_color(tt_v)}
+            colors = {self.niveaux[ch]: v for ch, v in par_champ.items() if self.niveaux.get(ch)}
 
         changed = False
         with _lock:
@@ -235,9 +243,7 @@ class _TslServer:
                 self.last_change        = time.time()
                 self.last_change_idx    = index
                 self.last_change_colors = {
-                    "lh": colors[self.tally_base],
-                    "rh": colors[self.tally_base + 1],
-                    "tt": colors[self.tally_base + 2],
+                    ch: colors.get(self.niveaux.get(ch), "off") for ch in ("lh", "rh", "tt")
                 }
 
         # Mettre à jour la colonne label depuis le texte TSL (cols 2-9 seulement)
@@ -339,7 +345,7 @@ class _TslServer:
                 "conn_id":       self.conn_id,
                 "port":          self.port,
                 "label_col":     self.label_col,
-                "tally_base":    self.tally_base,
+                "niveaux":       dict(self.niveaux),
                 "running":       self.running,
                 "clients":       self.clients,
                 "uptime":        up,
@@ -358,13 +364,13 @@ class _TslClient:
 
     KEEPALIVE_S = 5.0
 
-    def __init__(self, conn_id, dest_host, dest_port, label_col, tally_base,
+    def __init__(self, conn_id, dest_host, dest_port, label_col, niveaux,
                  rouge_field="tt", vert_field="lh"):
         self.conn_id     = conn_id
         self.dest_host   = dest_host
         self.port        = dest_port
         self.label_col   = label_col
-        self.tally_base  = tally_base
+        self.niveaux     = dict(niveaux or {})   # {"lh"|"rh"|"tt": id de niveau}
         self.rouge_field = rouge_field
         self.vert_field  = vert_field
         self._stop   = threading.Event()
@@ -394,9 +400,11 @@ class _TslClient:
         from app.database import db_get_tsl_mapping, db_get_source_label_for_shm
         with _lock:
             state = dict(_tally_state)
-        base = int(self.tally_base or 0)
-        r_lvl = base + _OFF_FIELD.get(self.rouge_field, 2)
-        v_lvl = base + _OFF_FIELD.get(self.vert_field, 0)
+        # Quel NIVEAU alimente le rouge, et lequel le vert : c'est un choix de l'afficheur d'en
+        # face, pas une propriété du signal. `rouge_field`/`vert_field` disent lequel des trois
+        # champs de CETTE connexion porte quoi ; le niveau, lui, vient de l'affectation.
+        r_lvl = self.niveaux.get(self.rouge_field or "tt")
+        v_lvl = self.niveaux.get(self.vert_field or "lh")
         out = []
         try:
             mapping = db_get_tsl_mapping(self.conn_id)
@@ -463,13 +471,14 @@ class _TslClient:
 _mixer_pub_thr = None
 _mixer_written: dict = {}   # base → {(idx, lvl)} écrits par nous (pour purger proprement)
 
-def _sortie_a_l_antenne(ct, base, idx_for):
+def _sortie_a_l_antenne(ct, niveaux, idx_for):
     """La sortie PGM de ce mélangeur porte-t-elle un tally, sur les niveaux de SA production ?
 
     ★ SUR SES NIVEAUX À LUI, pas sur n'importe lesquels. Le système fait tourner plusieurs
-    productions en même temps (`projects.tally_base`, espacés de 3) : « à l'antenne » n'a de sens
-    que rapporté à une production. Regarder tous les niveaux ferait qu'un mélangeur de la
-    production 2 s'allume parce qu'un signal homonyme est à l'antenne sur la production 5.
+    productions en même temps, chacune possédant ses niveaux (`tally_levels.owner_*`) :
+    « à l'antenne » n'a de sens que rapporté à une production. Regarder tous les niveaux ferait
+    qu'un mélangeur de la production 2 s'allume parce qu'un signal homonyme est à l'antenne
+    sur la production 5.
 
     C'est la sortie **PGM** qui décide — `CLEAN` et `PVW` ne disent rien de la diffusion.
     Renvoie False si on ne sait pas : ne pas savoir n'est pas une raison d'allumer un rouge."""
@@ -489,20 +498,21 @@ def _sortie_a_l_antenne(ct, base, idx_for):
         if idx is None:
             return False
         with _lock:
-            return any(_tally_state.get((idx, base + n)) == "red" for n in range(3))
+            return any(_tally_state.get((idx, n)) == "red" for n in (niveaux or ()))
     except Exception as e:
         log.debug("TSL: propagation — sortie de %s indéterminable (%s)", ct.get("vmid"), e)
         return False
 
 
-def _mixer_field_levels(base, conns_by_base):
-    """Sous-niveaux rouge/vert pour une base : ceux de la connexion physique si elle
-    existe (cohérence avec ses consommateurs), sinon convention projet LH/RH."""
-    conn = conns_by_base.get(base)
-    if conn:
-        return (base + _OFF_FIELD.get(conn.get("rouge_field") or "tt", 2),
-                base + _OFF_FIELD.get(conn.get("vert_field") or "lh", 0))
-    return base + 0, base + 1   # LH=rouge, RH=vert (pseudo-connexion projet)
+def _mixer_field_levels(niveaux):
+    """(niveau du rouge, niveau du vert) parmi ceux d'un mélangeur.
+
+    ⚠ Le PREMIER niveau porte le rouge et le SECOND le vert — c'est la convention héritée, et elle
+    reste une convention, pas une règle. Le chantier `TODO.md § TALLY` prévoit de la rendre
+    configurable par bus (émettre ou non sur PGM, sur PVW, et vers quel niveau) : la câbler ici
+    serait refaire ce qu'on vient de dénouer. En attendant, on préserve le comportement existant."""
+    n = list(niveaux or [])
+    return (n[0] if n else None), (n[1] if len(n) > 1 else None)
 
 def _mixer_publisher():
     import requests as _req
@@ -519,10 +529,9 @@ def _mixer_publisher():
 def _mixer_publisher_tick(_req, db_get_containers, db_get_projects,
                           db_get_tsl_connections):
     from app.metrics import get_container_ip
-    projs = {p["id"]: p for p in db_get_projects()}
-    conns_by_base = {int(c.get("tally_base") or 0): c
-                     for c in db_get_tsl_connections()
-                     if c.get("enabled") and (c.get("direction") or "in") == "in"}
+    # `db_get_projects` / `db_get_tsl_connections` restent dans la signature : l'appelant les
+    # injecte, et les bancs s'en servent. Depuis le dénouement, les niveaux d'un mélangeur se
+    # lisent sur `tally_levels`, plus en recoupant les bases des uns et des autres.
     ports_by_pid = _ports_snapshot()["by_pid"]
     changed = False
     for ct in db_get_containers():
@@ -538,14 +547,17 @@ def _mixer_publisher_tick(_req, db_get_containers, db_get_projects,
         params = dc.get("params") or {}
         if not params.get("tally_emit"):
             continue
-        # Niveau : sélectionnable, défaut = celui du projet du mixer.
-        base = params.get("tally_level_base")
+        # NIVEAUX de ce mélangeur : ceux qu'il déclare, sinon ceux de sa production. C'est une
+        # LISTE depuis le dénouement — le cas « un seul » n'est que la liste à un élément.
+        from app.database import db_get_tally_levels_of
         pid = ct.get("project_id")
-        if base in (None, "") and pid and pid in projs:
-            base = projs[pid].get("tally_base")
-        if base in (None, ""):
+        niveaux = params.get("tally_level_base") or []
+        if isinstance(niveaux, int):
+            niveaux = [niveaux]
+        if not niveaux:
+            niveaux = db_get_tally_levels_of("project", pid)
+        if not niveaux:
             continue
-        base = int(base)
         try:
             ip = get_container_ip(ct["vmid"])
             if not ip:
@@ -564,7 +576,7 @@ def _mixer_publisher_tick(_req, db_get_containers, db_get_projects,
                 if p.get("kind") == "source" and _port_shm(p) == shm:
                     return int(p.get("ord") or 0)
             return None
-        r_lvl, v_lvl = _mixer_field_levels(base, conns_by_base)
+        r_lvl, v_lvl = _mixer_field_levels(niveaux)
         want = {}
         # ★ LE TALLY SE PROPAGE : un mélangeur ne tallye ses entrées que si SA PROPRE SORTIE est
         # à l'antenne. Jusqu'ici l'émission était inconditionnelle — un mélangeur de préparation
@@ -575,7 +587,7 @@ def _mixer_publisher_tick(_req, db_get_containers, db_get_projects,
         # tous, mais un site dont la sortie de mélangeur n'est mappée nulle part perdrait sinon
         # son tally du jour au lendemain, sans avoir rien demandé — sur une fonction d'antenne.
         # Le décocher, c'est demander la propagation.
-        if not params.get("tally_force", True) and not _sortie_a_l_antenne(ct, base, _idx_for):
+        if not params.get("tally_force", True) and not _sortie_a_l_antenne(ct, niveaux, _idx_for):
             want = {}
         else:
             i_pgm, i_pvw = _idx_for(shm_pgm), _idx_for(shm_pvw)
@@ -583,14 +595,15 @@ def _mixer_publisher_tick(_req, db_get_containers, db_get_projects,
                 want[(i_pgm, r_lvl)] = "red"
             if i_pvw is not None:
                 want[(i_pvw, v_lvl)] = "green"
-        prev = _mixer_written.get(base, {})
+        cle_ecrit = tuple(niveaux)
+        prev = _mixer_written.get(cle_ecrit, {})
         if want != prev:
             with _lock:
                 for key in prev:
                     if key not in want:
                         _tally_state.pop(key, None)
                 _tally_state.update(want)
-            _mixer_written[base] = want
+            _mixer_written[cle_ecrit] = want
             changed = True
     if changed:
         _tally_dirty.set()
@@ -616,28 +629,37 @@ def _distributor():
 
         try:
             containers = db_get_containers()
-            # Niveau de Tally = bande tally_base : indexer les connexions ENTRANTES
-            # actives par bande (les sortantes consomment l'état, ne le servent pas).
-            conns_by_base = {int(c.get("tally_base") or 0): c
-                             for c in db_get_tsl_connections()
-                             if c.get("enabled") and (c.get("direction") or "in") == "in"}
-            for c in conns_by_base.values():
-                c["_key"] = int(c.get("id") or 0)
-            # Pseudo-connexions PAR PROJET (chantier 5) : chaque projet a son niveau de
-            # tally (tally_base) — s'il n'y a pas de connexion physique sur cette bande,
-            # une pseudo-connexion la sert (écrivain = mixer publisher). Index = ports.
+            # PORTEURS de niveaux : les connexions ENTRANTES actives (les sortantes consomment
+            # l'état, elles ne le servent pas) et les productions. Depuis le dénouement, chacun
+            # POSSÈDE ses niveaux — on ne les recoupe plus par une bande commune, et deux
+            # porteurs ne peuvent plus se disputer un niveau par construction.
+            from app.database import db_get_tally_levels_of, db_get_projects
+            porteurs = []
+            for c in db_get_tsl_connections():
+                if not c.get("enabled") or (c.get("direction") or "in") != "in":
+                    continue
+                niv = [c.get("%s_level_id" % ch) for ch in ("lh", "rh", "tt")]
+                porteurs.append({"_key": int(c.get("id") or 0), "niveaux": niv,
+                                 "rouge_field": c.get("rouge_field") or "tt",
+                                 "vert_field": c.get("vert_field") or "lh", "_project": None})
+            # Pseudo-porteurs PAR PRODUCTION : l'écrivain est l'émetteur du mélangeur, et
+            # l'index d'une source est son port (ord).
             try:
-                from app.database import db_get_projects
                 for pr in db_get_projects():
-                    tb = pr.get("tally_base")
-                    if tb is None or int(tb) in conns_by_base:
+                    niv = db_get_tally_levels_of("project", pr["id"])
+                    if not niv:
                         continue
-                    conns_by_base[int(tb)] = {
-                        "_key": f"proj:{pr['id']}", "id": None, "tally_base": int(tb),
-                        "rouge_field": "lh", "vert_field": "rh", "_project": pr["id"],
-                    }
+                    porteurs.append({"_key": "proj:%s" % pr["id"], "niveaux": niv,
+                                     "rouge_field": "lh", "vert_field": "rh",
+                                     "_project": pr["id"]})
             except Exception:
                 pass
+            # niveau → porteur : c'est par là que le multiview retrouve qui sert son niveau.
+            porteur_de_niveau = {}
+            for pt in porteurs:
+                for n in pt["niveaux"]:
+                    if n:
+                        porteur_de_niveau.setdefault(n, pt)
             # En central l'index TSL d'un PiP est déduit de SA source : lookup inverse
             # (connexion, source_shm RÉSOLU) → tsl_index. Un mapping peut référencer
             # "port:<id>" — résolu vers le shm bindé ; le label garde la ref d'origine.
@@ -652,8 +674,8 @@ def _distributor():
                 idx_by_conn_shm[key] = int(m.get("tsl_index") or 0)
                 if ref != shm_m:
                     label_ref[key] = ref
-            # Ports des pseudo-connexions projet : index d'une source = son port (ord).
-            for base, c in conns_by_base.items():
+            # Ports des pseudo-porteurs projet : index d'une source = son port (ord).
+            for c in porteurs:
                 pidc = c.get("_project")
                 if not pidc:
                     continue
@@ -663,12 +685,12 @@ def _distributor():
                         key = (c["_key"], shm_p)
                         idx_by_conn_shm[key] = int(p.get("ord") or 0)
                         label_ref[key] = f"port:{p['id']}"
-            # tally_base par projet (défaut de niveau des containers du projet).
+            # Niveaux par projet : défaut d'un conteneur qui n'en déclare pas.
             try:
-                from app.database import db_get_projects as _dgp
-                proj_tb = {pr["id"]: pr.get("tally_base") for pr in _dgp()}
+                proj_niv = {pr["id"]: db_get_tally_levels_of("project", pr["id"])
+                            for pr in db_get_projects()}
             except Exception:
-                proj_tb = {}
+                proj_niv = {}
         except Exception:
             continue
 
@@ -713,12 +735,16 @@ def _distributor():
                         shm_c = shm_c[len("/dev/shm/"):]
                     if not shm_c:
                         continue
-                    niv = int(cible.get("niveau") or 0)
-                    if not niv and ct.get("project_id") in proj_tb \
-                            and proj_tb[ct.get("project_id")] is not None:
-                        niv = int(proj_tb[ct.get("project_id")]) // 3 + 1
-                    conn_c = conns_by_base.get((niv - 1) * 3) if niv else None
-                    b_c = (niv - 1) * 3 if niv else 0
+                    # Niveaux demandés par le plugin : liste d'identifiants, vide = ceux de
+                    # son projet. Le champ garde son nom historique `niveau`, mais ce n'est plus
+                    # un numéro de bande.
+                    niv_c = cible.get("niveau") or []
+                    if isinstance(niv_c, int):
+                        niv_c = [niv_c] if niv_c else []
+                    if not niv_c:
+                        niv_c = proj_niv.get(ct.get("project_id")) or []
+                    conn_c = next((porteur_de_niveau[n] for n in niv_c
+                                   if n in porteur_de_niveau), None)
                     # LE TEXTE EST RÉSOLU MÊME SANS NIVEAU DE TALLY. Un scope peut vouloir le
                     # libellé vivant d'une source sans jamais l'allumer en rouge — et c'est
                     # même le cas courant : un instrument n'est pas à l'antenne.
@@ -732,8 +758,10 @@ def _distributor():
                         ck_c = conn_c.get("_key", int(conn_c.get("id") or 0))
                         ti = idx_by_conn_shm.get((ck_c, shm_c))
                         if ti is not None:
-                            rl = b_c + _OFF.get(conn_c.get("rouge_field") or "tt", 2)
-                            vl = b_c + _OFF.get(conn_c.get("vert_field") or "lh", 0)
+                            _nc = conn_c["niveaux"]
+                            rl = (_nc[_OFF.get(conn_c.get("rouge_field") or "tt", 2)]
+                                  if len(_nc) > 2 else None)
+                            vl = _nc[_OFF.get(conn_c.get("vert_field") or "lh", 0)] if _nc else None
                             if state.get((ti, rl), "off") != "off":
                                 coul_r = "red"
                             if state.get((ti, vl), "off") != "off":
@@ -754,20 +782,22 @@ def _distributor():
             for i, fc in enumerate(flux_config):
                 if not isinstance(fc, dict):
                     continue
-                # Niveau de Tally (1-4) = bande tally_base ; couleurs = Rouge/Vert cochées.
-                # DÉFAUT (chantier 5) : sans niveau explicite, un container de projet
-                # utilise le niveau de tally DE SON PROJET.
-                niveau = int(fc.get("tally_level") or 0)
+                # NIVEAUX de cette tuile : une LISTE d'identifiants depuis le dénouement.
+                # Vide = « ceux de mon projet ». Le numéro de bande 1-based a disparu : il
+                # réintroduisait le « 3 » de TSL au cœur d'un réglage de multiview.
+                niveaux_fc = fc.get("tally_level") or []
+                if isinstance(niveaux_fc, int):
+                    niveaux_fc = [niveaux_fc]
                 want_red   = bool(fc.get("tally_red"))
                 want_green = bool(fc.get("tally_green"))
                 want_text  = fc.get("label_source") == "protocol"
-                if not niveau and ct.get("project_id") in proj_tb \
-                        and proj_tb[ct.get("project_id")] is not None:
-                    niveau = int(proj_tb[ct.get("project_id")]) // 3 + 1
-                if not niveau or not (want_red or want_green or want_text):
+                if not niveaux_fc:
+                    niveaux_fc = proj_niv.get(ct.get("project_id")) or []
+                if not niveaux_fc or not (want_red or want_green or want_text):
                     continue
-                base = (niveau - 1) * 3
-                conn = conns_by_base.get(base)        # connexion servant ce niveau (Rouge/Vert)
+                # Le porteur est celui qui POSSÈDE ces niveaux — plus une bande à recouper.
+                conn = next((porteur_de_niveau[n] for n in niveaux_fc
+                             if n in porteur_de_niveau), None)
                 if not conn:
                     continue
                 # Index TSL déduit de la source du PiP (pas saisi à la main en central).
@@ -779,8 +809,9 @@ def _distributor():
                 tsl_index = idx_by_conn_shm.get((ckey, shm))
                 if tsl_index is None:
                     continue
-                r_lvl  = base + _OFF.get(conn.get("rouge_field") or "tt", 2)
-                v_lvl  = base + _OFF.get(conn.get("vert_field")  or "lh", 0)
+                _niv = conn["niveaux"]
+                r_lvl = _niv[_OFF.get(conn.get("rouge_field") or "tt", 2)] if len(_niv) > 2 else None
+                v_lvl = _niv[_OFF.get(conn.get("vert_field") or "lh", 0)] if _niv else None
                 label_col = int(fc.get("label_col") or 0)
 
                 # Couleur FORCÉE (Rouge/Vert) si le champ correspondant est actif (≠ off).
@@ -813,20 +844,23 @@ def _distributor():
                 except Exception:
                     o_text = ""
                 active = False
-                o_niveau = int(ov.get("tally_level") or 0)
-                if not o_niveau and ct.get("project_id") in proj_tb \
-                        and proj_tb[ct.get("project_id")] is not None:
-                    o_niveau = int(proj_tb[ct.get("project_id")]) // 3 + 1
-                if o_niveau and (ov.get("tally_red") or ov.get("tally_green")):
-                    o_base = (o_niveau - 1) * 3
-                    o_conn = conns_by_base.get(o_base)
+                o_niv = ov.get("tally_level") or []
+                if isinstance(o_niv, int):
+                    o_niv = [o_niv] if o_niv else []
+                if not o_niv:
+                    o_niv = proj_niv.get(ct.get("project_id")) or []
+                if o_niv and (ov.get("tally_red") or ov.get("tally_green")):
+                    o_conn = next((porteur_de_niveau[n] for n in o_niv
+                                   if n in porteur_de_niveau), None)
                     if o_conn:
                         row_res = resolve_ref(row_shm) or row_shm
                         o_idx = idx_by_conn_shm.get(
                             (o_conn.get("_key", int(o_conn.get("id") or 0)), row_res))
                         if o_idx is not None:
-                            r_l = o_base + _OFF.get(o_conn.get("rouge_field") or "tt", 2)
-                            v_l = o_base + _OFF.get(o_conn.get("vert_field")  or "lh", 0)
+                            _no = o_conn["niveaux"]
+                            r_l = (_no[_OFF.get(o_conn.get("rouge_field") or "tt", 2)]
+                                   if len(_no) > 2 else None)
+                            v_l = _no[_OFF.get(o_conn.get("vert_field") or "lh", 0)] if _no else None
                             red_on   = bool(ov.get("tally_red"))   and state.get((o_idx, r_l), "off") != "off"
                             green_on = bool(ov.get("tally_green")) and state.get((o_idx, v_l), "off") != "off"
                             active = red_on or green_on
@@ -906,13 +940,17 @@ def reload():
             _connections[cid].stop()
             del _connections[cid]
 
+        def _niveaux(row):
+            """Les trois niveaux que cette connexion alimente, depuis ses colonnes dédiées."""
+            return {ch: row.get("%s_level_id" % ch) for ch in ("lh", "rh", "tt")}
+
         def _mk(row):
             if (row.get("direction") or "in") == "out":
                 return _TslClient(row["id"], row.get("dest_host") or "127.0.0.1",
-                                  row["port"], row["label_col"], row["tally_base"],
+                                  row["port"], row["label_col"], _niveaux(row),
                                   rouge_field=row.get("rouge_field") or "tt",
                                   vert_field=row.get("vert_field") or "lh")
-            return _TslServer(row["id"], row["port"], row["label_col"], row["tally_base"])
+            return _TslServer(row["id"], row["port"], row["label_col"], _niveaux(row))
 
         for row in rows:
             cid = row["id"]
@@ -929,7 +967,7 @@ def reload():
                 _connections[cid] = srv
                 srv.start()
             elif (srv.port != row["port"] or srv.label_col != row["label_col"]
-                  or srv.tally_base != row["tally_base"] or is_out != want_out
+                  or srv.niveaux != _niveaux(row) or is_out != want_out
                   or (want_out and getattr(srv, "dest_host", None) != (row.get("dest_host") or "127.0.0.1"))):
                 srv.stop()
                 srv2 = _mk(row)
@@ -1244,19 +1282,19 @@ def register_routes(bp):
         renvoie que les LIBELLÉS, pas d'index — la page Câbles lisait donc `src.tsl_index` sur un
         objet qui n'a jamais eu ce champ, et ses pastilles de tally ne se sont jamais allumées.
 
-        `levels` = les trois niveaux alloués à la connexion (LH=base, RH=base+1, TT=base+2) : deux
+        `levels` = les trois niveaux affectés à la connexion (ses champs LH/RH/TT) : deux
         connexions peuvent employer le MÊME index pour des sources différentes, l'index seul ne
         suffit donc pas à décider si une lampe nous concerne."""
         out = {}
         for c in db_get_tsl_connections():
-            base = int(c.get("tally_base") or 0)
+            niv = [c.get("%s_level_id" % ch) for ch in ("lh", "rh", "tt")]
             for m in db_get_tsl_mapping(c["id"]):
                 shm = (m.get("source_shm") or "").strip()
                 if not shm:
                     continue
                 out.setdefault(shm, []).append({
                     "connection_id": c["id"], "name": c.get("name") or "",
-                    "tsl_index": m["tsl_index"], "levels": [base, base + 1, base + 2]})
+                    "tsl_index": m["tsl_index"], "levels": [n for n in niv if n]})
         return jsonify(out)
 
     @bp.route("/api/tsl/mapping/<int:cid>/<int:idx>", methods=["POST", "PUT"])
@@ -1353,7 +1391,7 @@ def register_routes(bp):
         else:
             db_upsert_tsl_connection(
                 {"name": "Connexion par défaut", "port": port, "enabled": enabled,
-                 "label_col": 2, "tally_base": 0})
+                 "label_col": 2})
         reload()
         return jsonify(status_dict())
 
