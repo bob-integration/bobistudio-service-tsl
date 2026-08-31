@@ -487,7 +487,11 @@ def _sortie_a_l_antenne(ct, niveaux, idx_for):
         from app import plugins as _plg
         dc = ct.get("deploy_config")
         dc = _json.loads(dc) if isinstance(dc, str) else (dc or {})
-        w = _plg.derive_wiring(dc.get("type"), ct.get("hostname")) or {}
+        # ⚠ AVEC LES PARAMS. `derive_wiring` déplie les ports `repeat` sur eux : sans params, un
+        # plugin dont les sorties se déplient (`repeat: "video_channels"`) renvoie une liste VIDE,
+        # et la garde bloquerait son émission pour toujours. Le mélangeur y échappait parce que
+        # ses trois sorties sont statiques — c'est une coïncidence, pas une propriété.
+        w = _plg.derive_wiring(dc.get("type"), ct.get("hostname"), dc.get("params") or {}) or {}
         prod = w.get("produces") or []
         pgm = next((p for p in prod if (p.get("label") or "").upper() == "PGM"), None) or \
             (prod[0] if prod else None)
@@ -607,6 +611,125 @@ def _mixer_publisher_tick(_req, db_get_containers, db_get_projects,
             changed = True
     if changed:
         _tally_dirty.set()
+
+
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+# PROPAGATION du tally — remonter le graphe depuis les sorties à l'antenne
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+# La règle, en une ligne :
+#
+#     tally(entrée d'un élément) = tally(sortie de cet élément) ET (cette entrée CONTRIBUE)
+#
+# La récursion part des flux qu'un ÉMETTEUR a tallyés — aujourd'hui un contrôleur broadcast (VSM)
+# via TSL, demain un Receiver IS-07 — et remonte le graphe de câblage (`derive_wiring`).
+#
+# ★ « CONTRIBUE » DÉPEND DU TYPE, et ce qu'on ne sait pas ne propage RIEN. Un élément traversant
+#   (delay, correcteur, UDC) contribue toujours : sa sortie EST son entrée, transformée. Un
+#   mélangeur ne contribue que par sa source PGM. Un DVE ne contribue que par ses sources
+#   VISIBLES — et il ne sait pas encore le dire, donc il ne propage rien.
+#
+#   Inventer une contribution allumerait un rouge sur une source qui n'est pas à l'antenne : c'est
+#   exactement le défaut qu'on corrige, à l'envers. `_CONTRIBUTION` est donc une liste FERMÉE, et
+#   tout type absent vaut « je ne sais pas » — pas « tout ».
+#
+# ⚠ PLAFOND DE PROFONDEUR. Le graphe MXL peut boucler (une sortie recâblée sur une entrée en
+#   amont, un aller-retour d'incrustation). Sans plafond, la propagation ne rendrait jamais la
+#   main — et elle tourne dans la boucle du distributeur.
+
+_PROFONDEUR_MAX = 12
+
+# Ce qui contribue à la sortie d'un élément, PAR TYPE. Liste fermée : un type absent ne propage
+# rien. Voir TODO.md § TALLY pour les deux familles qui manquent encore (mélangeur configurable,
+# DVE), différées parce qu'elles demandent de toucher des plugins.
+_CONTRIBUTION = {
+    "delay":            "toutes",
+    "color_corrector":  "toutes",
+    "udc":              "toutes",
+    "avsync":           "toutes",
+    "transcoder":       "toutes",
+    "v210_bridge":      "toutes",
+    "mixer":            "pgm",
+}
+
+
+def _producteur_de(shm, par_shm):
+    return par_shm.get(shm)
+
+
+def _entrees_contributives(ct, dc, etat_ctrl):
+    """Les shm d'entrée qui contribuent à la sortie de ce conteneur. [] si on ne sait pas.
+
+    `etat_ctrl` = le `/state` du conteneur, ou None. Un mélangeur ne contribue que par sa source
+    PGM : sans son état, on ne SAIT pas laquelle — et on ne propage rien plutôt que de deviner."""
+    from app import plugins as _plg
+    from app.numerotation import cle_input
+    regle = _CONTRIBUTION.get(dc.get("type") or "")
+    if not regle:
+        return []
+    params = dc.get("params") or {}
+    w = _plg.derive_wiring(dc.get("type"), ct.get("hostname"), params) or {}
+    entrees = []
+    for p in (w.get("consumes") or []):
+        if (p.get("essence") or "video") != "video":
+            continue
+        shm = (params.get(p.get("state_field") or "") or "").strip()
+        if shm:
+            entrees.append(shm)
+    if regle == "toutes":
+        return entrees
+    if regle == "pgm":
+        if not etat_ctrl:
+            return []
+        pgm = etat_ctrl.get("pgm")
+        if pgm is None:
+            return []
+        # Le câblage vient de l'ÉTAT VIVANT, comme dans `_mixer_publisher_tick` : c'est lui qui
+        # sait sur quoi le mélangeur est réellement branché à cet instant. Les params ne servent
+        # que de repli — ils peuvent être en retard d'un câblage à chaud.
+        shm = (etat_ctrl.get(cle_input(pgm)) or params.get(cle_input(pgm)) or "").strip()
+        return [shm] if shm else []
+    return []
+
+
+def propager(etat, par_shm, idx_de_shm, etat_ctrl_de):
+    """{(index, niveau): couleur} À AJOUTER par propagation. Ne modifie rien.
+
+    `par_shm`       : shm produit → (conteneur, deploy_config)
+    `idx_de_shm`    : shm → index TSL, ou None
+    `etat_ctrl_de`  : vmid → `/state` du conteneur, ou None
+
+    Renvoie un dict SÉPARÉ plutôt que d'écrire dans `_tally_state` : l'appelant doit pouvoir
+    distinguer ce qu'un émetteur a dit de ce que nous avons déduit. Sans cette séparation, un
+    tally propagé deviendrait indiscernable d'un tally reçu au tour suivant, et se propagerait
+    à son tour — la boucle se referme sur elle-même."""
+    ajouts = {}
+    # File des (shm à l'antenne, niveau, couleur) à remonter.
+    file = []
+    for (idx, niveau), couleur in (etat or {}).items():
+        if couleur == "off":
+            continue
+        for shm, i in (idx_de_shm or {}).items():
+            if i == idx:
+                file.append((shm, niveau, couleur, 0))
+    vus = set()
+    while file:
+        shm, niveau, couleur, prof = file.pop()
+        if prof >= _PROFONDEUR_MAX or (shm, niveau) in vus:
+            continue
+        vus.add((shm, niveau))
+        cible = _producteur_de(shm, par_shm)
+        if not cible:
+            continue
+        ct, dc = cible
+        for amont in _entrees_contributives(ct, dc, etat_ctrl_de.get(ct.get("vmid"))):
+            idx_amont = (idx_de_shm or {}).get(amont)
+            if idx_amont is None:
+                continue          # une source sans index n'est adressable par personne
+            cle = (idx_amont, niveau)
+            if (etat or {}).get(cle, "off") == "off" and ajouts.get(cle, "off") == "off":
+                ajouts[cle] = couleur
+            file.append((amont, niveau, couleur, prof + 1))
+    return ajouts
 
 
 def _distributor():
