@@ -469,7 +469,16 @@ class _TslClient:
 # Résolution entrée mixer → shm → PORT du projet → index (= port.ord).
 
 _mixer_pub_thr = None
-_mixer_written: dict = {}   # base → {(idx, lvl)} écrits par nous (pour purger proprement)
+_mixer_written: dict = {}   # niveaux → {(idx, lvl)} écrits par nous (pour purger proprement)
+# Dernier `/state` connu de chaque mélangeur, DÉPOSÉ par l'émetteur qui l'interroge déjà toutes
+# les 0,3 s. La propagation le relit : refaire la requête depuis le distributeur doublerait le
+# trafic vers les conteneurs pour la même information, à la même fraîcheur.
+_etat_mixer: dict = {}
+
+
+def _plg_wiring(type_, hostname, params):
+    from app import plugins as _plg
+    return _plg.derive_wiring(type_, hostname, params) or {}
 
 def _sortie_a_l_antenne(ct, niveaux, idx_for):
     """La sortie PGM de ce mélangeur porte-t-elle un tally, sur les niveaux de SA production ?
@@ -569,6 +578,7 @@ def _mixer_publisher_tick(_req, db_get_containers, db_get_projects,
             st = _req.get(f"http://{ip}:8082/state", timeout=0.8).json()
         except Exception:
             continue
+        _etat_mixer[ct["vmid"]] = st
         pgm, pvw = st.get("pgm"), st.get("pvw")
         shm_pgm = (st.get(cle_input(pgm)) or "") if pgm is not None else ""
         shm_pvw = (st.get(cle_input(pvw)) or "") if pvw is not None else ""
@@ -691,11 +701,14 @@ def _entrees_contributives(ct, dc, etat_ctrl):
     return []
 
 
-def propager(etat, par_shm, idx_de_shm, etat_ctrl_de):
+def propager(etat, par_shm, idx_de, etat_ctrl_de):
     """{(index, niveau): couleur} À AJOUTER par propagation. Ne modifie rien.
 
     `par_shm`       : shm produit → (conteneur, deploy_config)
-    `idx_de_shm`    : shm → index TSL, ou None
+    `idx_de`        : callable(shm, niveau) → index TSL, ou None. Une CALLABLE et non un dict :
+                      l'index d'un flux dépend du PORTEUR du niveau — deux porteurs peuvent
+                      employer le même index pour des sources différentes, et une table à plat
+                      ferait propager sur le mauvais signal.
     `etat_ctrl_de`  : vmid → `/state` du conteneur, ou None
 
     Renvoie un dict SÉPARÉ plutôt que d'écrire dans `_tally_state` : l'appelant doit pouvoir
@@ -708,8 +721,8 @@ def propager(etat, par_shm, idx_de_shm, etat_ctrl_de):
     for (idx, niveau), couleur in (etat or {}).items():
         if couleur == "off":
             continue
-        for shm, i in (idx_de_shm or {}).items():
-            if i == idx:
+        for shm in (par_shm or {}):
+            if idx_de(shm, niveau) == idx:
                 file.append((shm, niveau, couleur, 0))
     vus = set()
     while file:
@@ -722,7 +735,7 @@ def propager(etat, par_shm, idx_de_shm, etat_ctrl_de):
             continue
         ct, dc = cible
         for amont in _entrees_contributives(ct, dc, etat_ctrl_de.get(ct.get("vmid"))):
-            idx_amont = (idx_de_shm or {}).get(amont)
+            idx_amont = idx_de(amont, niveau)
             if idx_amont is None:
                 continue          # une source sans index n'est adressable par personne
             cle = (idx_amont, niveau)
@@ -814,6 +827,38 @@ def _distributor():
                             for pr in db_get_projects()}
             except Exception:
                 proj_niv = {}
+
+            # ── PROPAGATION : remonter le graphe depuis les flux à l'antenne ──────────────
+            # Ses déductions s'ajoutent à `state` POUR CE TOUR seulement, jamais à
+            # `_tally_state`. C'est ce qui empêche la boucle : un tally propagé qu'on écrirait
+            # dans l'état deviendrait, au tour suivant, indiscernable d'un tally REÇU, et se
+            # propagerait à son tour d'un cran de plus, indéfiniment.
+            try:
+                par_shm = {}
+                for _ct in containers:
+                    _dc = _ct.get("deploy_config")
+                    _dc = json.loads(_dc) if isinstance(_dc, str) else (_dc or {})
+                    if not _dc:
+                        continue
+                    _w = _plg_wiring(_dc.get("type"), _ct.get("hostname"), _dc.get("params") or {})
+                    for _p in (_w.get("produces") or []):
+                        _shm = (_p.get("shm") or "").strip()
+                        if _shm:
+                            par_shm.setdefault(_shm, (_ct, _dc))
+
+                def _idx_de(shm, niveau):
+                    """Index de ce flux CHEZ LE PORTEUR du niveau — deux porteurs peuvent
+                    employer le même index pour des sources différentes."""
+                    pt = porteur_de_niveau.get(niveau)
+                    if not pt:
+                        return None
+                    return idx_by_conn_shm.get((pt["_key"], resolve_ref(shm) or shm))
+
+                deduits = propager(state, par_shm, _idx_de, _etat_mixer)
+                for _k, _v in deduits.items():
+                    state.setdefault(_k, _v)
+            except Exception as e:
+                log.debug("TSL: propagation ignorée ce tour (%s)", e)
         except Exception:
             continue
 
