@@ -6,8 +6,9 @@
 """Service TSL 5.0 centralisé — multi-connexions, 10 niveaux tally, 10 colonnes labels.
 
 Chaque connexion TSL (tsl_connections DB) ouvre son propre serveur TCP.
-Le tally est stocké par (index, niveau), où `niveau` est un identifiant de `tally_levels` —
-une ENTITÉ nommée, pas un décalage. Une connexion TSL alimente UN niveau : sa chaîne de
+Le tally est stocké par (index, niveau), où `niveau` est l'UUID d'une ligne de `tally_levels` —
+une ENTITÉ nommée, pas un décalage, et une identité qui ne bouge JAMAIS (le numéro qu'affiche
+l'interface n'est qu'un rang, que réordonner réécrit). Une connexion TSL alimente UN niveau : sa chaîne de
 destination. Ses trois champs LH/RH/TT ne sont pas trois chaînes, ce sont trois façons
 d'exprimer l'état de celle-ci — `rouge_field`/`vert_field` disent lesquels portent le rouge et
 le vert, et un niveau a PLUSIEURS ÉTATS (`off`/`red`/`green`/`amber`), l'ambre étant le cumul.
@@ -801,7 +802,7 @@ def _distributor():
                 if not c.get("enabled") or (c.get("direction") or "in") != "in":
                     continue
                 porteurs.append({"_key": int(c.get("id") or 0),
-                                 "niveaux": [c.get("level_id")], "_project": None})
+                                 "niveaux": [c.get("level_uuid")], "_project": None})
             # Pseudo-porteurs PAR PRODUCTION : l'écrivain est l'émetteur du mélangeur, et
             # l'index d'une source est son port (ord).
             try:
@@ -1135,7 +1136,7 @@ def reload():
             del _connections[cid]
 
         def _mk(row):
-            niveau = row.get("level_id")
+            niveau = row.get("level_uuid")
             rf = row.get("rouge_field") or "tt"
             vf = row.get("vert_field") or "lh"
             if (row.get("direction") or "in") == "out":
@@ -1160,7 +1161,7 @@ def reload():
                 _connections[cid] = srv
                 srv.start()
             elif (srv.port != row["port"] or srv.label_col != row["label_col"]
-                  or srv.niveau != row.get("level_id")
+                  or srv.niveau != row.get("level_uuid")
                   or srv.rouge_field != (row.get("rouge_field") or "tt")
                   or srv.vert_field != (row.get("vert_field") or "lh")
                   or is_out != want_out
@@ -1484,7 +1485,7 @@ def register_routes(bp):
         concerne."""
         out = {}
         for c in db_get_tsl_connections():
-            niv = [c.get("level_id")]
+            niv = [c.get("level_uuid")]
             for m in db_get_tsl_mapping(c["id"]):
                 shm = (m.get("source_shm") or "").strip()
                 if not shm:

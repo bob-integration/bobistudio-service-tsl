@@ -180,7 +180,11 @@ function _tslRenderConns() {
                 </select>
             </td>
             <td style="padding:var(--space-1) var(--space-2)">
-<!-- ★ UN NIVEAU, PLUS UNE BANDE ET PLUS TROIS. Le sélecteur listait `[0,3,6,9]` en dur —
+<!-- ★ UN NIVEAU, PLUS UNE BANDE ET PLUS TROIS. Le sélecteur listait « 0, 3, 6, 9 » en dur —
+                     ⚠ AUCUN ACCENT GRAVE DANS CE COMMENTAIRE : il vit à l'intérieur d'un
+                     template literal JS, où un accent grave FERME la chaîne. Le code reste
+                     syntaxiquement valide — « node --check » ne voit rien — mais la fonction de
+                     rendu lève à l'exécution et la table reste vide.
                      quatre bandes de trois, soit la trame TSL 5.0 recopiée dans l'interface, et un
                      plafond de quatre productions qui n'existait nulle part ailleurs. Une première
                      correction avait donné TROIS niveaux par connexion, un par champ : c'était
@@ -190,7 +194,7 @@ function _tslRenderConns() {
                      plusieurs états — dont l'ambre, qui est le cumul des deux. -->
                 <select class="tsl-c-niv" style="width:190px">
                     <option value="">—</option>
-                    ${(_tslNiveaux||[]).map(n => `<option value="${n.id}" ${n.id === c.level_id ? 'selected' : ''}>${n.id} — ${escapeHtml(n.nom || '')}</option>`).join('')}
+                    ${(_tslNiveaux||[]).map(n => `<option value="${n.uuid}" ${n.uuid === c.level_uuid ? 'selected' : ''}>${n.num} — ${escapeHtml(n.nom || '')}</option>`).join('')}
                 </select>
             </td>
             <td style="padding:var(--space-1) var(--space-2);white-space:nowrap">
@@ -208,7 +212,7 @@ function _tslRenderConns() {
 }
 
 function tslConnAdd() {
-    _tslConns.push({ id: null, name: 'Nouvelle connexion', port: 12345, enabled: 0, label_col: 2, level_id: null, rouge_field: 'tt', vert_field: 'lh', direction: 'in', dest_host: '', project_id: null, status: {} });
+    _tslConns.push({ id: null, name: 'Nouvelle connexion', port: 12345, enabled: 0, label_col: 2, level_uuid: null, rouge_field: 'tt', vert_field: 'lh', direction: 'in', dest_host: '', project_id: null, status: {} });
     _tslRenderConns();
 }
 
@@ -240,7 +244,7 @@ async function tslConnSave(cid) {
         port:       parseInt(row.querySelector('.tsl-c-port').value) || 12345,
         enabled:    row.querySelector('.tsl-c-enabled').checked ? 1 : 0,
         label_col:  parseInt(row.querySelector('.tsl-c-label-col').value) || 2,
-        level_id:   parseInt(row.querySelector('.tsl-c-niv').value) || null,
+        level_uuid: row.querySelector('.tsl-c-niv').value || null,
         rouge_field: row.querySelector('.tsl-c-rouge').value || 'tt',
         vert_field:  row.querySelector('.tsl-c-vert').value || 'lh',
         direction:  row.querySelector('.tsl-c-direction').value || 'in',
@@ -275,10 +279,14 @@ function _tslRenderTallyState(state) {
         const map  = _tslMapByConn[conn.id] || {};
         // Le niveau de CETTE connexion, et ses états. Rouge et vert ne sont plus deux niveaux :
         // ce sont deux états du même, et « amber » les allume tous les deux.
-        const lvl0 = conn.level_id;
+        const lvl0 = conn.level_uuid;
         const idxSet = new Set();
         for (const k of Object.keys(state || {})) {
-            const [idx, lvl] = k.split('_').map(Number);
+            // Clé « <index>_<uuid> ». On coupe au PREMIER souligné : un UUID n'en contient
+            // pas, mais `split('_').map(Number)` le rendait NaN et n'appariait plus rien.
+            const cut = k.indexOf('_');
+            if (cut < 0) continue;
+            const idx = Number(k.slice(0, cut)), lvl = k.slice(cut + 1);
             if (lvl0 && lvl === lvl0) idxSet.add(idx);
         }
         const rows = [];
