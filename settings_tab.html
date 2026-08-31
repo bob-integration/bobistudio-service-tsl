@@ -93,6 +93,7 @@ async function rafraichirTsl() {
             fetch('/api/tsl/mapping_all'),
         ]);
         if (rc.ok)     _tslConns      = await rc.json();
+        await tslNiveauxLoad();
         if (rl.ok)     _tslLabelNames = await rl.json();
         if (rs.ok)     _tslSources    = await rs.json();
         if (rmap.ok) {
@@ -161,8 +162,6 @@ function _tslRenderConns() {
     tbody.innerHTML = _tslConns.map(c => {
         const colLabel = _tslLabelNames[c.label_col] || `Col ${c.label_col}`;
         const dirOut = (c.direction || 'in') === 'out';
-        const projOpts = (_tslProjects || []).map(p =>
-            `<option value="p${p.id}" ${c.project_id === p.id ? 'selected' : ''}>Projet — ${escapeHtml(p.name)}</option>`).join('');
         return `<tr style="border-bottom:1px solid var(--border)" data-cid="${c.id}">
             <td style="padding:var(--space-1) var(--space-2)"><input type="text" class="tsl-c-name" value="${escapeHtml(c.name)}" style="width:140px"></td>
             <td style="padding:var(--space-1) var(--space-2);white-space:nowrap">
@@ -181,10 +180,21 @@ function _tslRenderConns() {
                 </select>
             </td>
             <td style="padding:var(--space-1) var(--space-2)">
-                <select class="tsl-c-tally-base">
-                    ${[0,3,6,9].map(b => `<option value="${b}" ${(!c.project_id && b === c.tally_base) ? 'selected' : ''}>Niveau ${b/3+1}</option>`).join('')}
-                    ${projOpts}
-                </select>
+<!-- ★ TROIS NIVEAUX, PLUS UNE BANDE. Le sélecteur listait `[0,3,6,9]` en dur — quatre
+                     bandes de trois, soit la trame TSL 5.0 recopiée dans l'interface, et un
+                     plafond de quatre productions qui n'existait nulle part ailleurs. Une
+                     connexion choisit maintenant, pour chacun de ses trois champs, LEQUEL des
+                     niveaux du site il alimente. Le « 3 » reste — c'est sa trame — mais il ne
+                     décide plus de la numérotation de personne. -->
+                <div style="display:flex;gap:4px;align-items:center;white-space:nowrap">
+                    ${['lh','rh','tt'].map(ch => `
+                        <label style="font-size:.75em;color:var(--text-muted)">${ch.toUpperCase()}
+                            <select class="tsl-c-niv-${ch}" style="width:104px">
+                                <option value="">—</option>
+                                ${(_tslNiveaux||[]).map(n => `<option value="${n.id}" ${n.id === c[ch+'_level_id'] ? 'selected' : ''}>${n.id} — ${escapeHtml(n.nom || '')}</option>`).join('')}
+                            </select>
+                        </label>`).join('')}
+                </div>
             </td>
             <td style="padding:var(--space-1) var(--space-2);white-space:nowrap">
                 <span style="color:#cc2222">●</span> <select class="tsl-c-rouge" style="width:56px">${FIELD_OPTS(c.rouge_field || 'tt')}</select>
@@ -201,11 +211,21 @@ function _tslRenderConns() {
 }
 
 function tslConnAdd() {
-    _tslConns.push({ id: null, name: 'Nouvelle connexion', port: 12345, enabled: 0, label_col: 2, tally_base: 0, rouge_field: 'tt', vert_field: 'lh', direction: 'in', dest_host: '', project_id: null, status: {} });
+    _tslConns.push({ id: null, name: 'Nouvelle connexion', port: 12345, enabled: 0, label_col: 2, lh_level_id: null, rh_level_id: null, tt_level_id: null, rouge_field: 'tt', vert_field: 'lh', direction: 'in', dest_host: '', project_id: null, status: {} });
     _tslRenderConns();
 }
 
 let _tslProjects = [];
+// Niveaux de tally du site. Ils ne sont plus dérivés d'une bande : ils sont ALLOUÉS ailleurs
+// (Réglages → Labels & Tally), et cette page ne fait qu'y raccorder ses trois champs.
+let _tslNiveaux = [];
+
+async function tslNiveauxLoad() {
+    try {
+        const r = await fetch('/api/tally/levels');
+        if (r.ok) _tslNiveaux = await r.json();
+    } catch (e) { _tslNiveaux = []; }
+}
 async function _tslLoadProjects() {
     try {
         const r = await fetch('/api/projects');
@@ -217,16 +237,15 @@ async function tslConnSave(cid) {
     const row = document.querySelector(`[data-cid="${cid}"]`) ||
                 document.querySelector('[data-cid="null"]');
     if (!row) return;
-    const baseVal = row.querySelector('.tsl-c-tally-base').value;
-    const isProj  = String(baseVal).startsWith('p');
     const data = {
         id:         cid || null,
         name:       row.querySelector('.tsl-c-name').value,
         port:       parseInt(row.querySelector('.tsl-c-port').value) || 12345,
         enabled:    row.querySelector('.tsl-c-enabled').checked ? 1 : 0,
         label_col:  parseInt(row.querySelector('.tsl-c-label-col').value) || 2,
-        tally_base: isProj ? 0 : (parseInt(baseVal) || 0),
-        project_id: isProj ? parseInt(baseVal.slice(1)) : null,
+        lh_level_id: parseInt(row.querySelector('.tsl-c-niv-lh').value) || null,
+        rh_level_id: parseInt(row.querySelector('.tsl-c-niv-rh').value) || null,
+        tt_level_id: parseInt(row.querySelector('.tsl-c-niv-tt').value) || null,
         rouge_field: row.querySelector('.tsl-c-rouge').value || 'tt',
         vert_field:  row.querySelector('.tsl-c-vert').value || 'lh',
         direction:  row.querySelector('.tsl-c-direction').value || 'in',
@@ -248,7 +267,7 @@ async function tslConnDel(cid) {
 
 // ── État tally ────────────────────────────────────────────────────────────────
 // Tous les tallies actifs, regroupés par protocole (connexion). Niveaux = LH/RH/TT
-// dérivés du tally_base de chaque connexion. On n'affiche que les index réellement actifs.
+// des trois niveaux affectés à chaque connexion. On n'affiche que les index réellement actifs.
 function _tslRenderTallyState(state) {
     const el = document.getElementById('tsl_tally_state');
     if (!el) return;
@@ -259,20 +278,21 @@ function _tslRenderTallyState(state) {
     let html = '';
     let anyActive = false;
     for (const conn of (_tslConns || [])) {
-        const base = conn.tally_base || 0;
         const map  = _tslMapByConn[conn.id] || {};
-        const rOff = OFF[conn.rouge_field || 'tt'] ?? 2;   // niveau Rouge de cette connexion
-        const vOff = OFF[conn.vert_field  || 'lh'] ?? 0;   // niveau Vert
-        // index présents pour les niveaux de cette connexion
+        // Les trois niveaux de CETTE connexion, et lesquels portent le rouge et le vert.
+        const niv  = {lh: conn.lh_level_id, rh: conn.rh_level_id, tt: conn.tt_level_id};
+        const rLvl = niv[conn.rouge_field || 'tt'];
+        const vLvl = niv[conn.vert_field  || 'lh'];
+        const siens = new Set([niv.lh, niv.rh, niv.tt].filter(Boolean));
         const idxSet = new Set();
         for (const k of Object.keys(state || {})) {
             const [idx, lvl] = k.split('_').map(Number);
-            if (lvl === base || lvl === base + 1 || lvl === base + 2) idxSet.add(idx);
+            if (siens.has(lvl)) idxSet.add(idx);
         }
         const rows = [];
         for (const idx of [...idxSet].sort((a, b) => a - b)) {
-            const rougeOn = (state[`${idx}_${base + rOff}`] || 'off') !== 'off';
-            const vertOn  = (state[`${idx}_${base + vOff}`] || 'off') !== 'off';
+            const rougeOn = rLvl ? (state[`${idx}_${rLvl}`] || 'off') !== 'off' : false;
+            const vertOn  = vLvl ? (state[`${idx}_${vLvl}`] || 'off') !== 'off' : false;
             if (!rougeOn && !vertOn) continue;   // actifs uniquement
             const shm = map[idx];
             const src = shm ? ` <span class="meta" style="font-size:0.85em">${escapeHtml(shm)}</span>` : '';
@@ -426,6 +446,7 @@ async function _tslLivePoll() {
             fetch('/api/tsl/state'),
         ]);
         if (rc.ok)     _tslConns = await rc.json();
+        await tslNiveauxLoad();
         _tslUpdateConnStatus();
         if (rstate.ok) _tslRenderTallyState(await rstate.json());
     } catch(e) { /* silencieux : poll best-effort */ }
