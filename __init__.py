@@ -7,8 +7,11 @@
 
 Chaque connexion TSL (tsl_connections DB) ouvre son propre serveur TCP.
 Le tally est stocké par (index, niveau), où `niveau` est un identifiant de `tally_levels` —
-une ENTITÉ nommée, pas un décalage. TSL projette ses trois champs (LH/RH/TT) sur trois niveaux
-affectés par connexion : le « 3 » est la trame de TSL, il ne structure plus le modèle.
+une ENTITÉ nommée, pas un décalage. Une connexion TSL alimente UN niveau : sa chaîne de
+destination. Ses trois champs LH/RH/TT ne sont pas trois chaînes, ce sont trois façons
+d'exprimer l'état de celle-ci — `rouge_field`/`vert_field` disent lesquels portent le rouge et
+le vert, et un niveau a PLUSIEURS ÉTATS (`off`/`red`/`green`/`amber`), l'ambre étant le cumul.
+Le « 3 » est la trame de TSL, il ne structure plus le modèle.
 Le distributor lit les deploy_config des multiviews et envoie color + text par fenêtre.
 
 Protocole TSL 5.0 (offsets vérifiés sur le fil VSM, capture 2026-06-30) :
@@ -122,18 +125,22 @@ def build_control(red: bool, green: bool, rouge_field: str, vert_field: str) -> 
 class _TslServer:
     """Un serveur TCP TSL pour une ligne tsl_connections."""
 
-    def __init__(self, conn_id, port, label_col, niveaux):
-        """`niveaux` = {"lh": id, "rh": id, "tt": id} — les trois niveaux que CETTE connexion
-        alimente par ses trois champs.
+    def __init__(self, conn_id, port, label_col, niveau,
+                 rouge_field="tt", vert_field="lh"):
+        """`niveau` = l'UNIQUE niveau que cette connexion alimente (None = elle n'écrit rien).
 
-        ★ Plus de base historique. Le mot de contrôle TSL 5.0 réserve deux bits par champ, pour trois
-        champs : c'est SA trame, et elle reste ici. Ce qui a disparu, c'est que ce « 3 » structure
-        le modèle interne — une production n'est plus plafonnée à trois chaînes de destination
-        parce que TSL en a trois."""
+        ★ Plus de base historique, et plus de niveau par champ. Le mot de contrôle TSL 5.0 réserve
+        deux bits par champ, pour trois champs : c'est SA trame, elle reste ici et sert à décider
+        de l'ÉTAT du niveau (`rouge_field` porte le rouge, `vert_field` le vert, les deux à la
+        fois donnent l'ambre). Ce qui a disparu, c'est que ce « 3 » structure le modèle interne —
+        une production n'est plus plafonnée à trois chaînes de destination parce que TSL en a
+        trois, et une chaîne n'occupe plus trois numéros pour en exprimer un seul état."""
         self.conn_id    = conn_id
         self.port       = port
         self.label_col  = label_col    # colonne label mise à jour par TSL text
-        self.niveaux    = dict(niveaux or {})
+        self.niveau      = niveau
+        self.rouge_field = (rouge_field or "tt").lower()
+        self.vert_field  = (vert_field or "lh").lower()
         self._stop      = threading.Event()
         self._thread    = None
         self._lock      = threading.Lock()
@@ -225,10 +232,15 @@ class _TslServer:
                 if has_green: return "green"
                 return "off"
 
-            # Un champ dont le niveau n'est pas affecté n'écrit RIEN — plutôt que d'écrire
-            # sur un niveau deviné, ce qui allumerait un rouge chez quelqu'un d'autre.
+            # Une connexion sans niveau affecté n'écrit RIEN — plutôt que d'écrire sur un
+            # niveau deviné, ce qui allumerait un rouge chez quelqu'un d'autre.
             par_champ = {"lh": _tsl_color(lh_v), "rh": _tsl_color(rh_v), "tt": _tsl_color(tt_v)}
-            colors = {self.niveaux[ch]: v for ch, v in par_champ.items() if self.niveaux.get(ch)}
+            colors = {}
+            if self.niveau:
+                rouge = par_champ.get(self.rouge_field, "off") in ("red", "amber")
+                vert  = par_champ.get(self.vert_field,  "off") in ("green", "amber")
+                colors = {self.niveau: ("amber" if rouge and vert else
+                                        "red" if rouge else "green" if vert else "off")}
 
         changed = False
         with _lock:
@@ -242,9 +254,9 @@ class _TslServer:
             with self._lock:
                 self.last_change        = time.time()
                 self.last_change_idx    = index
-                self.last_change_colors = {
-                    ch: colors.get(self.niveaux.get(ch), "off") for ch in ("lh", "rh", "tt")
-                }
+                # Diagnostic : on montre les TROIS champs du fil, pas l'état déduit — c'est
+                # justement l'écart entre les deux qu'on vient chercher quand ça ne s'allume pas.
+                self.last_change_colors = dict(par_champ)
 
         # Mettre à jour la colonne label depuis le texte TSL (cols 2-9 seulement)
         if text and self.label_col >= 2:
@@ -345,7 +357,7 @@ class _TslServer:
                 "conn_id":       self.conn_id,
                 "port":          self.port,
                 "label_col":     self.label_col,
-                "niveaux":       dict(self.niveaux),
+                "niveau":        self.niveau,
                 "running":       self.running,
                 "clients":       self.clients,
                 "uptime":        up,
@@ -364,13 +376,13 @@ class _TslClient:
 
     KEEPALIVE_S = 5.0
 
-    def __init__(self, conn_id, dest_host, dest_port, label_col, niveaux,
+    def __init__(self, conn_id, dest_host, dest_port, label_col, niveau,
                  rouge_field="tt", vert_field="lh"):
         self.conn_id     = conn_id
         self.dest_host   = dest_host
         self.port        = dest_port
         self.label_col   = label_col
-        self.niveaux     = dict(niveaux or {})   # {"lh"|"rh"|"tt": id de niveau}
+        self.niveau      = niveau                # l'UNIQUE niveau que cet afficheur montre
         self.rouge_field = rouge_field
         self.vert_field  = vert_field
         self._stop   = threading.Event()
@@ -400,11 +412,11 @@ class _TslClient:
         from app.database import db_get_tsl_mapping, db_get_source_label_for_shm
         with _lock:
             state = dict(_tally_state)
-        # Quel NIVEAU alimente le rouge, et lequel le vert : c'est un choix de l'afficheur d'en
-        # face, pas une propriété du signal. `rouge_field`/`vert_field` disent lequel des trois
-        # champs de CETTE connexion porte quoi ; le niveau, lui, vient de l'affectation.
-        r_lvl = self.niveaux.get(self.rouge_field or "tt")
-        v_lvl = self.niveaux.get(self.vert_field or "lh")
+        # UN niveau, plusieurs ÉTATS. `rouge_field`/`vert_field` ne choisissent pas DEUX
+        # niveaux : ils disent dans quel champ de la trame l'afficheur d'en face attend le rouge
+        # et dans lequel il attend le vert. C'est un choix de câblage de l'afficheur, pas une
+        # propriété du signal — et le cumul (`amber`) allume les deux champs.
+        lvl = self.niveau
         out = []
         try:
             mapping = db_get_tsl_mapping(self.conn_id)
@@ -413,8 +425,9 @@ class _TslClient:
         for m in mapping:
             idx = int(m.get("tsl_index") or 0)
             ref = (m.get("source_shm") or "").strip()
-            red   = state.get((idx, r_lvl), "off") != "off"
-            green = state.get((idx, v_lvl), "off") != "off"
+            etat  = state.get((idx, lvl), "off") if lvl else "off"
+            red   = etat in ("red", "amber")
+            green = etat in ("green", "amber")
             control = build_control(red, green, self.rouge_field, self.vert_field)
             try:
                 text = db_get_source_label_for_shm(ref, self.label_col) or ""
@@ -517,15 +530,20 @@ def _sortie_a_l_antenne(ct, niveaux, idx_for):
         return False
 
 
-def _mixer_field_levels(niveaux):
-    """(niveau du rouge, niveau du vert) parmi ceux d'un mélangeur.
+_CUMUL = {frozenset(("red", "green")): "amber"}
 
-    ⚠ Le PREMIER niveau porte le rouge et le SECOND le vert — c'est la convention héritée, et elle
-    reste une convention, pas une règle. Le chantier `TODO.md § TALLY` prévoit de la rendre
-    configurable par bus (émettre ou non sur PGM, sur PVW, et vers quel niveau) : la câbler ici
-    serait refaire ce qu'on vient de dénouer. En attendant, on préserve le comportement existant."""
-    n = list(niveaux or [])
-    return (n[0] if n else None), (n[1] if len(n) > 1 else None)
+def cumuler(a, b):
+    """Cumul de deux états sur UN MÊME niveau. Rouge + vert = ambre.
+
+    ⚠ Ce n'est pas « PGM + PVW = orange » : rien ici ne connaît de bus. Deux CONTRIBUTIONS
+    arrivent sur le même niveau pour le même index, et un niveau a plusieurs états dont l'un
+    exprime la coexistence. C'est ce cumul, et lui seul, qui produit l'orange que voit
+    l'exploitant quand une source est à la fois au programme et en préparation."""
+    a, b = a or "off", b or "off"
+    if a == "off":  return b
+    if b == "off":  return a
+    if a == b:      return a
+    return _CUMUL.get(frozenset((a, b)), "amber")
 
 def _mixer_publisher():
     import requests as _req
@@ -590,8 +608,12 @@ def _mixer_publisher_tick(_req, db_get_containers, db_get_projects,
                 if p.get("kind") == "source" and _port_shm(p) == shm:
                     return int(p.get("ord") or 0)
             return None
-        r_lvl, v_lvl = _mixer_field_levels(niveaux)
         want = {}
+        def _poser(idx, couleur):
+            """Pose une contribution sur TOUS les niveaux du mélangeur, en cumulant."""
+            for lvl in niveaux:
+                cle = (idx, lvl)
+                want[cle] = cumuler(want.get(cle), couleur)
         # ★ LE TALLY SE PROPAGE : un mélangeur ne tallye ses entrées que si SA PROPRE SORTIE est
         # à l'antenne. Jusqu'ici l'émission était inconditionnelle — un mélangeur de préparation
         # allumait un rouge sur une caméra qui n'était diffusée nulle part. C'est le premier étage
@@ -605,10 +627,15 @@ def _mixer_publisher_tick(_req, db_get_containers, db_get_projects,
             want = {}
         else:
             i_pgm, i_pvw = _idx_for(shm_pgm), _idx_for(shm_pvw)
+            # ★ MÊME NIVEAU pour les deux. Avant le dénouement, le rouge et le vert partaient sur
+            # DEUX niveaux distincts (le 1er et le 2nd du mélangeur) : une source au programme ET
+            # en préparation occupait deux entrées qui ne se rencontraient jamais, et c'est
+            # l'afficheur qui recomposait l'orange en lisant les deux champs de la trame. Le cumul
+            # a désormais lieu ICI, sur le niveau — donc IS-07 et le multiview le voient aussi.
             if i_pgm is not None:
-                want[(i_pgm, r_lvl)] = "red"
+                _poser(i_pgm, "red")
             if i_pvw is not None:
-                want[(i_pvw, v_lvl)] = "green"
+                _poser(i_pvw, "green")
         cle_ecrit = tuple(niveaux)
         prev = _mixer_written.get(cle_ecrit, {})
         if want != prev:
@@ -751,7 +778,6 @@ def _distributor():
     from app.database import (db_get_containers, db_get_source_label_for_shm,
                                db_get_setting, db_get_tsl_connections,
                                db_get_tsl_mappings_all)
-    _OFF = {"lh": 0, "rh": 1, "tt": 2}
     _last_push: dict = {}   # vmid → (dernier payload poussé, ts) — anti-repush identique (cf. plus bas)
 
     while not _stop_evt.is_set():
@@ -774,10 +800,8 @@ def _distributor():
             for c in db_get_tsl_connections():
                 if not c.get("enabled") or (c.get("direction") or "in") != "in":
                     continue
-                niv = [c.get("%s_level_id" % ch) for ch in ("lh", "rh", "tt")]
-                porteurs.append({"_key": int(c.get("id") or 0), "niveaux": niv,
-                                 "rouge_field": c.get("rouge_field") or "tt",
-                                 "vert_field": c.get("vert_field") or "lh", "_project": None})
+                porteurs.append({"_key": int(c.get("id") or 0),
+                                 "niveaux": [c.get("level_id")], "_project": None})
             # Pseudo-porteurs PAR PRODUCTION : l'écrivain est l'émetteur du mélangeur, et
             # l'index d'une source est son port (ord).
             try:
@@ -786,7 +810,6 @@ def _distributor():
                     if not niv:
                         continue
                     porteurs.append({"_key": "proj:%s" % pr["id"], "niveaux": niv,
-                                     "rouge_field": "lh", "vert_field": "rh",
                                      "_project": pr["id"]})
             except Exception:
                 pass
@@ -796,6 +819,21 @@ def _distributor():
                 for n in pt["niveaux"]:
                     if n:
                         porteur_de_niveau.setdefault(n, pt)
+
+            def _porteur_pour(niveaux):
+                """(niveau servi, porteur) pour une demande — le premier niveau demandé dont
+                quelqu'un écrit l'état.
+
+                ★ LE NIVEAU DEMANDÉ EST LE NIVEAU LU. Avant le dénouement, on retrouvait le
+                porteur puis on RE-CHOISISSAIT deux de ses trois niveaux via `rouge_field`/
+                `vert_field` : le niveau demandé ne servait qu'à désigner le porteur, et pouvait
+                n'être lu par personne. Le rouge et le vert sont maintenant deux ÉTATS du même
+                niveau, et les champs TSL ne concernent plus que la mise sur le fil."""
+                for _n in (niveaux or ()):
+                    _pt = porteur_de_niveau.get(_n)
+                    if _pt:
+                        return _n, _pt
+                return None, None
             # En central l'index TSL d'un PiP est déduit de SA source : lookup inverse
             # (connexion, source_shm RÉSOLU) → tsl_index. Un mapping peut référencer
             # "port:<id>" — résolu vers le shm bindé ; le label garde la ref d'origine.
@@ -911,8 +949,7 @@ def _distributor():
                         niv_c = [niv_c] if niv_c else []
                     if not niv_c:
                         niv_c = proj_niv.get(ct.get("project_id")) or []
-                    conn_c = next((porteur_de_niveau[n] for n in niv_c
-                                   if n in porteur_de_niveau), None)
+                    lvl_c, conn_c = _porteur_pour(niv_c)
                     # LE TEXTE EST RÉSOLU MÊME SANS NIVEAU DE TALLY. Un scope peut vouloir le
                     # libellé vivant d'une source sans jamais l'allumer en rouge — et c'est
                     # même le cas courant : un instrument n'est pas à l'antenne.
@@ -926,14 +963,9 @@ def _distributor():
                         ck_c = conn_c.get("_key", int(conn_c.get("id") or 0))
                         ti = idx_by_conn_shm.get((ck_c, shm_c))
                         if ti is not None:
-                            _nc = conn_c["niveaux"]
-                            rl = (_nc[_OFF.get(conn_c.get("rouge_field") or "tt", 2)]
-                                  if len(_nc) > 2 else None)
-                            vl = _nc[_OFF.get(conn_c.get("vert_field") or "lh", 0)] if _nc else None
-                            if state.get((ti, rl), "off") != "off":
-                                coul_r = "red"
-                            if state.get((ti, vl), "off") != "off":
-                                coul_v = "green"
+                            _e = state.get((ti, lvl_c), "off")
+                            coul_r = "red"   if _e in ("red", "amber")   else "off"
+                            coul_v = "green" if _e in ("green", "amber") else "off"
                     updates_by_vmid.setdefault(ct["vmid"], []).append(
                         {"cle": str(cible.get("cle") or shm_c), "shm": shm_c,
                          "rouge": coul_r, "vert": coul_v, "texte": txt_c})
@@ -964,8 +996,7 @@ def _distributor():
                 if not niveaux_fc or not (want_red or want_green or want_text):
                     continue
                 # Le porteur est celui qui POSSÈDE ces niveaux — plus une bande à recouper.
-                conn = next((porteur_de_niveau[n] for n in niveaux_fc
-                             if n in porteur_de_niveau), None)
+                lvl_fc, conn = _porteur_pour(niveaux_fc)
                 if not conn:
                     continue
                 # Index TSL déduit de la source du PiP (pas saisi à la main en central).
@@ -977,14 +1008,13 @@ def _distributor():
                 tsl_index = idx_by_conn_shm.get((ckey, shm))
                 if tsl_index is None:
                     continue
-                _niv = conn["niveaux"]
-                r_lvl = _niv[_OFF.get(conn.get("rouge_field") or "tt", 2)] if len(_niv) > 2 else None
-                v_lvl = _niv[_OFF.get(conn.get("vert_field") or "lh", 0)] if _niv else None
                 label_col = int(fc.get("label_col") or 0)
 
-                # Couleur FORCÉE (Rouge/Vert) si le champ correspondant est actif (≠ off).
-                color_l = "red"   if (want_red   and state.get((tsl_index, r_lvl), "off") != "off") else "off"
-                color_r = "green" if (want_green and state.get((tsl_index, v_lvl), "off") != "off") else "off"
+                # Le niveau a plusieurs états : `amber` allume les DEUX bandeaux de la tuile,
+                # c'est ainsi que l'orange se voit sur le mur.
+                _e = state.get((tsl_index, lvl_fc), "off")
+                color_l = "red"   if (want_red   and _e in ("red", "amber"))   else "off"
+                color_r = "green" if (want_green and _e in ("green", "amber")) else "off"
                 try:
                     lref = label_ref.get((ckey, shm))
                     text = db_get_source_label_for_shm(lref or shm, label_col)
@@ -1018,19 +1048,15 @@ def _distributor():
                 if not o_niv:
                     o_niv = proj_niv.get(ct.get("project_id")) or []
                 if o_niv and (ov.get("tally_red") or ov.get("tally_green")):
-                    o_conn = next((porteur_de_niveau[n] for n in o_niv
-                                   if n in porteur_de_niveau), None)
+                    lvl_o, o_conn = _porteur_pour(o_niv)
                     if o_conn:
                         row_res = resolve_ref(row_shm) or row_shm
                         o_idx = idx_by_conn_shm.get(
                             (o_conn.get("_key", int(o_conn.get("id") or 0)), row_res))
                         if o_idx is not None:
-                            _no = o_conn["niveaux"]
-                            r_l = (_no[_OFF.get(o_conn.get("rouge_field") or "tt", 2)]
-                                   if len(_no) > 2 else None)
-                            v_l = _no[_OFF.get(o_conn.get("vert_field") or "lh", 0)] if _no else None
-                            red_on   = bool(ov.get("tally_red"))   and state.get((o_idx, r_l), "off") != "off"
-                            green_on = bool(ov.get("tally_green")) and state.get((o_idx, v_l), "off") != "off"
+                            _eo = state.get((o_idx, lvl_o), "off")
+                            red_on   = bool(ov.get("tally_red"))   and _eo in ("red", "amber")
+                            green_on = bool(ov.get("tally_green")) and _eo in ("green", "amber")
                             active = red_on or green_on
                 ovl = overlays_by_vmid.setdefault(vmid, [])
                 ovl.append({"id": ov.get("id"), "text": o_text, "active": active})
@@ -1108,17 +1134,16 @@ def reload():
             _connections[cid].stop()
             del _connections[cid]
 
-        def _niveaux(row):
-            """Les trois niveaux que cette connexion alimente, depuis ses colonnes dédiées."""
-            return {ch: row.get("%s_level_id" % ch) for ch in ("lh", "rh", "tt")}
-
         def _mk(row):
+            niveau = row.get("level_id")
+            rf = row.get("rouge_field") or "tt"
+            vf = row.get("vert_field") or "lh"
             if (row.get("direction") or "in") == "out":
                 return _TslClient(row["id"], row.get("dest_host") or "127.0.0.1",
-                                  row["port"], row["label_col"], _niveaux(row),
-                                  rouge_field=row.get("rouge_field") or "tt",
-                                  vert_field=row.get("vert_field") or "lh")
-            return _TslServer(row["id"], row["port"], row["label_col"], _niveaux(row))
+                                  row["port"], row["label_col"], niveau,
+                                  rouge_field=rf, vert_field=vf)
+            return _TslServer(row["id"], row["port"], row["label_col"], niveau,
+                              rouge_field=rf, vert_field=vf)
 
         for row in rows:
             cid = row["id"]
@@ -1135,7 +1160,10 @@ def reload():
                 _connections[cid] = srv
                 srv.start()
             elif (srv.port != row["port"] or srv.label_col != row["label_col"]
-                  or srv.niveaux != _niveaux(row) or is_out != want_out
+                  or srv.niveau != row.get("level_id")
+                  or srv.rouge_field != (row.get("rouge_field") or "tt")
+                  or srv.vert_field != (row.get("vert_field") or "lh")
+                  or is_out != want_out
                   or (want_out and getattr(srv, "dest_host", None) != (row.get("dest_host") or "127.0.0.1"))):
                 srv.stop()
                 srv2 = _mk(row)
@@ -1450,12 +1478,13 @@ def register_routes(bp):
         renvoie que les LIBELLÉS, pas d'index — la page Câbles lisait donc `src.tsl_index` sur un
         objet qui n'a jamais eu ce champ, et ses pastilles de tally ne se sont jamais allumées.
 
-        `levels` = les trois niveaux affectés à la connexion (ses champs LH/RH/TT) : deux
-        connexions peuvent employer le MÊME index pour des sources différentes, l'index seul ne
-        suffit donc pas à décider si une lampe nous concerne."""
+        `levels` = le niveau affecté à la connexion, en LISTE (l'appelant en attend une, et un
+        porteur pourra en servir plusieurs) : deux connexions peuvent employer le MÊME index pour
+        des sources différentes, l'index seul ne suffit donc pas à décider si une lampe nous
+        concerne."""
         out = {}
         for c in db_get_tsl_connections():
-            niv = [c.get("%s_level_id" % ch) for ch in ("lh", "rh", "tt")]
+            niv = [c.get("level_id")]
             for m in db_get_tsl_mapping(c["id"]):
                 shm = (m.get("source_shm") or "").strip()
                 if not shm:

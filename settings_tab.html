@@ -180,21 +180,18 @@ function _tslRenderConns() {
                 </select>
             </td>
             <td style="padding:var(--space-1) var(--space-2)">
-<!-- ★ TROIS NIVEAUX, PLUS UNE BANDE. Le sélecteur listait `[0,3,6,9]` en dur — quatre
-                     bandes de trois, soit la trame TSL 5.0 recopiée dans l'interface, et un
-                     plafond de quatre productions qui n'existait nulle part ailleurs. Une
-                     connexion choisit maintenant, pour chacun de ses trois champs, LEQUEL des
-                     niveaux du site il alimente. Le « 3 » reste — c'est sa trame — mais il ne
-                     décide plus de la numérotation de personne. -->
-                <div style="display:flex;gap:4px;align-items:center;white-space:nowrap">
-                    ${['lh','rh','tt'].map(ch => `
-                        <label style="font-size:.75em;color:var(--text-muted)">${ch.toUpperCase()}
-                            <select class="tsl-c-niv-${ch}" style="width:104px">
-                                <option value="">—</option>
-                                ${(_tslNiveaux||[]).map(n => `<option value="${n.id}" ${n.id === c[ch+'_level_id'] ? 'selected' : ''}>${n.id} — ${escapeHtml(n.nom || '')}</option>`).join('')}
-                            </select>
-                        </label>`).join('')}
-                </div>
+<!-- ★ UN NIVEAU, PLUS UNE BANDE ET PLUS TROIS. Le sélecteur listait `[0,3,6,9]` en dur —
+                     quatre bandes de trois, soit la trame TSL 5.0 recopiée dans l'interface, et un
+                     plafond de quatre productions qui n'existait nulle part ailleurs. Une première
+                     correction avait donné TROIS niveaux par connexion, un par champ : c'était
+                     transposer le « 3 » au lieu de s'en défaire. Une connexion sert UNE chaîne de
+                     destination, donc UN niveau ; ses trois champs disent seulement où l'afficheur
+                     d'en face attend le rouge et le vert (colonnes suivantes), et un niveau a
+                     plusieurs états — dont l'ambre, qui est le cumul des deux. -->
+                <select class="tsl-c-niv" style="width:190px">
+                    <option value="">—</option>
+                    ${(_tslNiveaux||[]).map(n => `<option value="${n.id}" ${n.id === c.level_id ? 'selected' : ''}>${n.id} — ${escapeHtml(n.nom || '')}</option>`).join('')}
+                </select>
             </td>
             <td style="padding:var(--space-1) var(--space-2);white-space:nowrap">
                 <span style="color:#cc2222">●</span> <select class="tsl-c-rouge" style="width:56px">${FIELD_OPTS(c.rouge_field || 'tt')}</select>
@@ -211,7 +208,7 @@ function _tslRenderConns() {
 }
 
 function tslConnAdd() {
-    _tslConns.push({ id: null, name: 'Nouvelle connexion', port: 12345, enabled: 0, label_col: 2, lh_level_id: null, rh_level_id: null, tt_level_id: null, rouge_field: 'tt', vert_field: 'lh', direction: 'in', dest_host: '', project_id: null, status: {} });
+    _tslConns.push({ id: null, name: 'Nouvelle connexion', port: 12345, enabled: 0, label_col: 2, level_id: null, rouge_field: 'tt', vert_field: 'lh', direction: 'in', dest_host: '', project_id: null, status: {} });
     _tslRenderConns();
 }
 
@@ -243,9 +240,7 @@ async function tslConnSave(cid) {
         port:       parseInt(row.querySelector('.tsl-c-port').value) || 12345,
         enabled:    row.querySelector('.tsl-c-enabled').checked ? 1 : 0,
         label_col:  parseInt(row.querySelector('.tsl-c-label-col').value) || 2,
-        lh_level_id: parseInt(row.querySelector('.tsl-c-niv-lh').value) || null,
-        rh_level_id: parseInt(row.querySelector('.tsl-c-niv-rh').value) || null,
-        tt_level_id: parseInt(row.querySelector('.tsl-c-niv-tt').value) || null,
+        level_id:   parseInt(row.querySelector('.tsl-c-niv').value) || null,
         rouge_field: row.querySelector('.tsl-c-rouge').value || 'tt',
         vert_field:  row.querySelector('.tsl-c-vert').value || 'lh',
         direction:  row.querySelector('.tsl-c-direction').value || 'in',
@@ -266,33 +261,31 @@ async function tslConnDel(cid) {
 }
 
 // ── État tally ────────────────────────────────────────────────────────────────
-// Tous les tallies actifs, regroupés par protocole (connexion). Niveaux = LH/RH/TT
-// des trois niveaux affectés à chaque connexion. On n'affiche que les index réellement actifs.
+// Tous les tallies actifs, regroupés par protocole (connexion). Un niveau par connexion, dont
+// on lit l'ÉTAT (off/red/green/amber). On n'affiche que les index réellement actifs.
 function _tslRenderTallyState(state) {
     const el = document.getElementById('tsl_tally_state');
     if (!el) return;
     const COLORS = { red: '#cc2222', green: '#22aa44', amber: '#cc8800', off: '#555' };
     const dot = c => `<span style="display:inline-block;width:9px;height:9px;border-radius:50%;background:${COLORS[c]||'#555'};vertical-align:middle"></span>`;
 
-    const OFF = { lh: 0, rh: 1, tt: 2 };
     let html = '';
     let anyActive = false;
     for (const conn of (_tslConns || [])) {
         const map  = _tslMapByConn[conn.id] || {};
-        // Les trois niveaux de CETTE connexion, et lesquels portent le rouge et le vert.
-        const niv  = {lh: conn.lh_level_id, rh: conn.rh_level_id, tt: conn.tt_level_id};
-        const rLvl = niv[conn.rouge_field || 'tt'];
-        const vLvl = niv[conn.vert_field  || 'lh'];
-        const siens = new Set([niv.lh, niv.rh, niv.tt].filter(Boolean));
+        // Le niveau de CETTE connexion, et ses états. Rouge et vert ne sont plus deux niveaux :
+        // ce sont deux états du même, et « amber » les allume tous les deux.
+        const lvl0 = conn.level_id;
         const idxSet = new Set();
         for (const k of Object.keys(state || {})) {
             const [idx, lvl] = k.split('_').map(Number);
-            if (siens.has(lvl)) idxSet.add(idx);
+            if (lvl0 && lvl === lvl0) idxSet.add(idx);
         }
         const rows = [];
         for (const idx of [...idxSet].sort((a, b) => a - b)) {
-            const rougeOn = rLvl ? (state[`${idx}_${rLvl}`] || 'off') !== 'off' : false;
-            const vertOn  = vLvl ? (state[`${idx}_${vLvl}`] || 'off') !== 'off' : false;
+            const etat    = lvl0 ? (state[`${idx}_${lvl0}`] || 'off') : 'off';
+            const rougeOn = etat === 'red'   || etat === 'amber';
+            const vertOn  = etat === 'green' || etat === 'amber';
             if (!rougeOn && !vertOn) continue;   // actifs uniquement
             const shm = map[idx];
             const src = shm ? ` <span class="meta" style="font-size:0.85em">${escapeHtml(shm)}</span>` : '';
