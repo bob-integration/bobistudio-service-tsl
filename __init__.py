@@ -463,6 +463,38 @@ class _TslClient:
 _mixer_pub_thr = None
 _mixer_written: dict = {}   # base → {(idx, lvl)} écrits par nous (pour purger proprement)
 
+def _sortie_a_l_antenne(ct, base, idx_for):
+    """La sortie PGM de ce mélangeur porte-t-elle un tally, sur les niveaux de SA production ?
+
+    ★ SUR SES NIVEAUX À LUI, pas sur n'importe lesquels. Le système fait tourner plusieurs
+    productions en même temps (`projects.tally_base`, espacés de 3) : « à l'antenne » n'a de sens
+    que rapporté à une production. Regarder tous les niveaux ferait qu'un mélangeur de la
+    production 2 s'allume parce qu'un signal homonyme est à l'antenne sur la production 5.
+
+    C'est la sortie **PGM** qui décide — `CLEAN` et `PVW` ne disent rien de la diffusion.
+    Renvoie False si on ne sait pas : ne pas savoir n'est pas une raison d'allumer un rouge."""
+    import json as _json
+    try:
+        from app import plugins as _plg
+        dc = ct.get("deploy_config")
+        dc = _json.loads(dc) if isinstance(dc, str) else (dc or {})
+        w = _plg.derive_wiring(dc.get("type"), ct.get("hostname")) or {}
+        prod = w.get("produces") or []
+        pgm = next((p for p in prod if (p.get("label") or "").upper() == "PGM"), None) or \
+            (prod[0] if prod else None)
+        shm = (pgm or {}).get("shm")
+        if not shm:
+            return False
+        idx = idx_for(shm)
+        if idx is None:
+            return False
+        with _lock:
+            return any(_tally_state.get((idx, base + n)) == "red" for n in range(3))
+    except Exception as e:
+        log.debug("TSL: propagation — sortie de %s indéterminable (%s)", ct.get("vmid"), e)
+        return False
+
+
 def _mixer_field_levels(base, conns_by_base):
     """Sous-niveaux rouge/vert pour une base : ceux de la connexion physique si elle
     existe (cohérence avec ses consommateurs), sinon convention projet LH/RH."""
@@ -534,11 +566,23 @@ def _mixer_publisher_tick(_req, db_get_containers, db_get_projects,
             return None
         r_lvl, v_lvl = _mixer_field_levels(base, conns_by_base)
         want = {}
-        i_pgm, i_pvw = _idx_for(shm_pgm), _idx_for(shm_pvw)
-        if i_pgm is not None:
-            want[(i_pgm, r_lvl)] = "red"
-        if i_pvw is not None:
-            want[(i_pvw, v_lvl)] = "green"
+        # ★ LE TALLY SE PROPAGE : un mélangeur ne tallye ses entrées que si SA PROPRE SORTIE est
+        # à l'antenne. Jusqu'ici l'émission était inconditionnelle — un mélangeur de préparation
+        # allumait un rouge sur une caméra qui n'était diffusée nulle part. C'est le premier étage
+        # du chantier « TALLY : le calculer par propagation » (TODO.md).
+        #
+        # `tally_force` (défaut VRAI) conserve l'ancien comportement : on livre la correction pour
+        # tous, mais un site dont la sortie de mélangeur n'est mappée nulle part perdrait sinon
+        # son tally du jour au lendemain, sans avoir rien demandé — sur une fonction d'antenne.
+        # Le décocher, c'est demander la propagation.
+        if not params.get("tally_force", True) and not _sortie_a_l_antenne(ct, base, _idx_for):
+            want = {}
+        else:
+            i_pgm, i_pvw = _idx_for(shm_pgm), _idx_for(shm_pvw)
+            if i_pgm is not None:
+                want[(i_pgm, r_lvl)] = "red"
+            if i_pvw is not None:
+                want[(i_pvw, v_lvl)] = "green"
         prev = _mixer_written.get(base, {})
         if want != prev:
             with _lock:
