@@ -596,7 +596,7 @@ def _mixer_publisher_tick(_req, db_get_containers, db_get_projects,
         from app.database import db_get_tally_levels_of
         pid = ct.get("project_id")
         niveaux = params.get("tally_level_base") or []
-        if isinstance(niveaux, int):
+        if not isinstance(niveaux, list):
             niveaux = [niveaux]
         if not niveaux:
             niveaux = db_get_tally_levels_of("project", pid)
@@ -953,8 +953,8 @@ def _distributor():
                     # son projet. Le champ garde son nom historique `niveau`, mais ce n'est plus
                     # un numéro de bande.
                     niv_c = cible.get("niveau") or []
-                    if isinstance(niv_c, int):
-                        niv_c = [niv_c] if niv_c else []
+                    if not isinstance(niv_c, list):
+                        niv_c = [niv_c]
                     if not niv_c:
                         niv_c = proj_niv.get(ct.get("project_id")) or []
                     lvl_c, conn_c = _porteur_pour(niv_c)
@@ -993,8 +993,13 @@ def _distributor():
                 # NIVEAUX de cette tuile : une LISTE d'identifiants depuis le dénouement.
                 # Vide = « ceux de mon projet ». Le numéro de bande 1-based a disparu : il
                 # réintroduisait le « 3 » de TSL au cœur d'un réglage de multiview.
+                # ⚠ UNE CHAÎNE N'EST PAS UNE LISTE, et Python ne le dira pas : depuis que les
+                # niveaux sont des UUID, un scalaire hérité est une CHAÎNE, et `for n in ...`
+                # l'aurait parcourue caractère par caractère — trente-six « niveaux » d'une
+                # lettre, dont aucun n'existe, donc un tally qui ne s'allume jamais et pas la
+                # moindre erreur.
                 niveaux_fc = fc.get("tally_level") or []
-                if isinstance(niveaux_fc, int):
+                if not isinstance(niveaux_fc, list):
                     niveaux_fc = [niveaux_fc]
                 want_red   = bool(fc.get("tally_red"))
                 want_green = bool(fc.get("tally_green"))
@@ -1051,8 +1056,8 @@ def _distributor():
                     o_text = ""
                 active = False
                 o_niv = ov.get("tally_level") or []
-                if isinstance(o_niv, int):
-                    o_niv = [o_niv] if o_niv else []
+                if not isinstance(o_niv, list):
+                    o_niv = [o_niv]
                 if not o_niv:
                     o_niv = proj_niv.get(ct.get("project_id")) or []
                 if o_niv and (ov.get("tally_red") or ov.get("tally_green")):
