@@ -35,53 +35,19 @@ log = logging.getLogger(__name__)
 # TSL qui l'a fait naître. Conséquence : `services/nmos/is07*.py` importait TSL pour poser son
 # tally, donc supprimer TSL aurait emporté IS-07. Le protocole qu'on remplace tenait le modèle.
 #
-# ⚠ CES RÉEXPORTS SONT UNE PASSERELLE, PAS UNE API. Ils existent pour qu'aucun appelant ne
-# casse pendant la migration. Tout NOUVEAU code vise `app.tally` directement ; les appelants
-# existants y sont déplacés un par un, et ce bloc disparaîtra quand il n'en restera aucun.
 from app import tally as _tally
-from app.tally import (
-    # l'état, en deux couches
-    _lock, _tally_par_source, _tally_state, _tally_dirty,   # lus par les BANCS
-    _cumul_des_sources, _poser_cases, poser_tally, poser_cases,
-    sources_du_tally, get_tally_state, get_tally_level, etat_brut,
-    attendre_changement, signaler_changement, acquitter_changement,
-    # cumul et propagation
-    cumuler, _CUMUL, propager, _entrees_contributives, _producteur_de,
-    _CONTRIBUTION, _PROFONDEUR_MAX,
-    # résolution de source
-    resolve_ref, _ports_cache, _ports_snapshot, _port_shm,
-    # registre des porteurs
-    enregistrer_porteur, retirer_porteur, liste_porteurs, porteur_pour,
-    rafraichir_porteurs_projets, index_chez, ref_chez,
-    noms_colonnes, nb_colonnes_actives, NOMS_COLONNES_DEFAUT,
-    # les deux fils et ce qu'ils utilisent — lus par les BANCS
-    _sortie_a_l_antenne, _plg_wiring, _mixer_publisher_tick, _distributor,
-    demarrer, arreter, fils_actifs,
-)
 
-# ⚠ Ces noms sont RÉEXPORTÉS, donc « inutilisés » pour un analyseur statique. `__all__` le lui
-# dit — sans quoi pyflakes rend 23 remarques à chaque passage et on apprend à les ignorer.
-__all__ = [
-    "poser_tally", "poser_cases", "sources_du_tally", "get_tally_state", "get_tally_level",
-    "etat_brut", "attendre_changement", "signaler_changement", "acquitter_changement",
-    "cumuler", "propager", "resolve_ref",
-    "enregistrer_porteur", "retirer_porteur", "liste_porteurs", "porteur_pour",
-    "rafraichir_porteurs_projets", "index_chez", "ref_chez",
-    "noms_colonnes", "nb_colonnes_actives", "NOMS_COLONNES_DEFAUT",
-    "_sortie_a_l_antenne", "_plg_wiring", "_mixer_publisher_tick", "_distributor",
-    "demarrer", "arreter", "fils_actifs",
-    "start_all", "stop_all", "reload", "start", "stop", "is_running",
-    "status_dict", "connections_status", "encode_tsl_frame", "build_control",
-    "noms_colonnes", "nb_colonnes_actives", "action_options", "run_action",
-    "register_routes",
-    # ⚠ Des noms PRIVÉS, et c'est assumé : onze bancs les lisent (`_tally_state`,
-    # `_PROFONDEUR_MAX`, `_entrees_contributives`…). Les retirer du pont ferait échouer des
-    # tests qui vérifient de vraies propriétés, pour un gain d'esthétique. Ils partiront avec
-    # les bancs, quand ceux-ci viseront `app.tally`.
-    "_tally_par_source", "_tally_state", "_tally_dirty", "_lock",
-    "_cumul_des_sources", "_poser_cases", "_CUMUL", "_CONTRIBUTION", "_PROFONDEUR_MAX",
-    "_entrees_contributives", "_producteur_de", "_ports_cache", "_ports_snapshot", "_port_shm",
-]
+# Ce que le SERVICE emploie du modèle. Ce n'est plus une passerelle : rien n'est réexporté ici,
+# et un appelant tiers qui voudrait le tally vise `app.tally`. La liste est courte, et c'est le
+# but — elle mesure ce qu'un protocole a besoin de savoir du tally, soit : poser une
+# contribution, lire l'état pour le mettre sur le fil, se déclarer porteur, et résoudre une
+# référence de source. Rien sur le CALCUL du tally, qui ne le regarde pas.
+from app.tally import (
+    poser_tally, etat_brut, get_tally_state, signaler_changement, attendre_changement,
+    resolve_ref, _ports_snapshot,
+    enregistrer_porteur, retirer_porteur, liste_porteurs,
+    noms_colonnes, nb_colonnes_actives,
+)
 
 # Propres au service : le verrou des CONNEXIONS, distinct de celui du modèle (cf. app/tally.py).
 _lock_conn = threading.Lock()
@@ -334,7 +300,7 @@ class _TslServer:
             self._brut[index] = dict(colors)
         changed = self._republier()
         if changed:
-            _tally_dirty.set()
+            signaler_changement()
             with self._lock:
                 self.last_change        = time.time()
                 self.last_change_idx    = index
@@ -454,7 +420,7 @@ class _TslServer:
 # ─── Distributor ───────────────────────────────────────────────────────────────
 class _TslClient:
     """Connexion TSL 5.0 SORTANTE (direction='out') : client TCP vers un UMD/écran
-    externe. Consomme _tally_state (réveillé par _tally_dirty, comme le distributor)
+    externe. Consomme l'état du modèle (réveillé par `attendre_changement`, comme le distributeur)
     et émet une trame par index mappé — uniquement sur changement (anti-spam),
     avec un rafraîchissement périodique keepalive."""
 
@@ -536,7 +502,7 @@ class _TslClient:
                 self._last_sent = {}
                 last_keepalive = 0.0
                 while not self._stop.is_set():
-                    _tally_dirty.wait(timeout=0.2)
+                    attendre_changement(0.2)
                     force = (time.time() - last_keepalive) >= self.KEEPALIVE_S
                     frames = self._frames(force=force)
                     if force:
@@ -837,7 +803,7 @@ def run_action(action_id, params, ctx):
             raise RuntimeError(f"« {ref} » n'appartient pas au projet (ports/sorties du projet seulement)")
     from app.database import db_upsert_source_label
     db_upsert_source_label(ref, {f"label_{col}": text})
-    _tally_dirty.set()   # les multiviews re-résolvent leurs labels
+    signaler_changement()   # les multiviews re-résolvent leurs libellés
     return True
 
 def connections_status() -> list:
@@ -896,7 +862,7 @@ def status_dict() -> dict:
             "uptime":         None,
             "last_pkt_ago_s": last_ago,
             "error":          "; ".join(errors) if errors else "",
-            "tally":          {f"{idx}_{lvl}": color for (idx, lvl), color in _tally_state.items()},
+            "tally":          get_tally_state(),
         }
 
 
