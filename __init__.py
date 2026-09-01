@@ -1298,6 +1298,40 @@ def _ref_options(pid=None):
     return out
 
 
+NOMS_COLONNES_DEFAUT = ["Hostname", "MXL", "Label 2", "Label 3", "Label 4",
+                        "Label 5", "Label 6", "Label 7", "Label 8", "Label 9"]
+
+
+def noms_colonnes():
+    """Les DIX noms de colonnes, toujours — y compris ceux des colonnes masquées."""
+    from app.database import db_get_setting
+    noms = db_get_setting("tsl_label_names", None)
+    if isinstance(noms, str):
+        try:
+            noms = json.loads(noms)
+        except Exception:
+            noms = None
+    if not isinstance(noms, list):
+        noms = []
+    return [str(noms[i]) if i < len(noms) and noms[i] else NOMS_COLONNES_DEFAUT[i]
+            for i in range(10)]
+
+
+def nb_colonnes_actives():
+    """Combien de colonnes PERSONNALISÉES sont offertes (1 à 8). Deux par défaut.
+
+    ⚠ LE DÉFAUT NE S'APPLIQUE QU'AUX INSTALLATIONS NEUVES. `_migrer_colonnes_libelles` pose la
+    valeur initiale au premier démarrage d'après ce qui EXISTE — une colonne renommée ou
+    remplie compte — sinon un site qui se sert de six colonnes en verrait quatre disparaître de
+    ses tableaux, sans un mot, pour un défaut qui ne le concernait pas."""
+    from app.database import db_get_setting
+    try:
+        n = int(db_get_setting("label_cols_actives", 2))
+    except (TypeError, ValueError):
+        n = 2
+    return max(1, min(8, n))
+
+
 def action_options(action_id, key, pid=None):
     """Options dynamiques des params d'action TSL (menus déroulants au lieu de champs
     libres). `set_label.ref` → sources ; `set_label.col` → colonnes 2-9 avec leur nom
@@ -1314,12 +1348,12 @@ def action_options(action_id, key, pid=None):
                 names = json.loads(names)
             except Exception:
                 names = None
-        names = names if isinstance(names, list) else []
-        out = []
-        for i in range(2, 10):
-            nm = names[i] if i < len(names) and names[i] else f"Label {i}"
-            out.append({"value": i, "label": f"{i} — {nm}"})
-        return out
+        del names
+        noms = noms_colonnes()
+        # Les colonnes MASQUÉES ne sont pas proposées : une macro qui écrirait dans une colonne
+        # que personne n'affiche serait une action sans effet visible.
+        return [{"value": i, "label": "%d — %s" % (i, noms[i])}
+                for i in range(2, 2 + nb_colonnes_actives())]
     return []
 
 
@@ -1616,20 +1650,52 @@ def register_routes(bp):
     @bp.route("/api/tsl/label_names", methods=["GET"])
     @require_login
     def tsl_label_names_get():
-        names = db_get_setting("tsl_label_names", None)
-        if not names or len(names) < 10:
-            names = ["Hostname", "MXL", "Label 2", "Label 3", "Label 4",
-                     "Label 5", "Label 6", "Label 7", "Label 8", "Label 9"]
-        return jsonify(names)
+        """Les colonnes de libellé OFFERTES : hostname, MXL, puis les personnalisées actives.
+
+        ★ ON EN REND MOINS QU'IL N'EN EXISTE, et c'est le point. Huit colonnes personnalisées
+        étaient proposées d'office ; un site en utilise deux ou trois, et les cinq autres
+        allongeaient chaque menu, chaque tableau et chaque sélecteur du produit sans rien porter.
+        Le nombre actif est un réglage (`label_cols_actives`, 2 par défaut) et les colonnes
+        s'ajoutent au besoin.
+
+        ⚠ LES HUIT COLONNES PHYSIQUES RESTENT. Réduire l'affichage n'efface aucune donnée : un
+        libellé écrit en colonne 7 reste lisible par son index (`db_get_source_label_for_shm`),
+        et réaugmenter le nombre le fait réapparaître intact. C'est ce qui rend le réglage
+        réversible sans risque."""
+        return jsonify(noms_colonnes()[:2 + nb_colonnes_actives()])
 
     @bp.route("/api/tsl/label_names", methods=["POST"])
     @require_perm("settings.edit")
     def tsl_label_names_set():
         data = request.json
-        if not isinstance(data, list) or len(data) != 10:
-            return jsonify({"error": "liste de 10 noms attendue"}), 400
-        db_set_setting("tsl_label_names", [str(n) for n in data])
+        if not isinstance(data, list) or not (3 <= len(data) <= 10):
+            return jsonify({"error": "liste de 3 à 10 noms attendue"}), 400
+        # On COMPLÈTE jusqu'à dix avec les noms déjà en base : enregistrer une liste tronquée
+        # écraserait le nom des colonnes masquées, qu'on retrouverait anonymes en les rouvrant.
+        anciens = noms_colonnes()
+        noms = [str(n) for n in data] + anciens[len(data):]
+        db_set_setting("tsl_label_names", noms[:10])
         return jsonify({"ok": True})
+
+    @bp.route("/api/tsl/label_cols", methods=["GET"])
+    @require_login
+    def tsl_label_cols_get():
+        return jsonify({"actives": nb_colonnes_actives(), "max": 8,
+                        "noms": noms_colonnes()})
+
+    @bp.route("/api/tsl/label_cols", methods=["POST"])
+    @require_perm("settings.edit")
+    def tsl_label_cols_set():
+        """`{"actives": n}` — combien de colonnes personnalisées sont offertes (1 à 8)."""
+        d = request.json or {}
+        try:
+            n = int(d.get("actives"))
+        except (TypeError, ValueError):
+            return jsonify({"error": "`actives` : entier attendu"}), 400
+        if not (1 <= n <= 8):
+            return jsonify({"error": "entre 1 et 8"}), 400
+        db_set_setting("label_cols_actives", n)
+        return jsonify({"ok": True, "actives": n})
 
 
     # ── État tally ────────────────────────────────────────────────────────────
