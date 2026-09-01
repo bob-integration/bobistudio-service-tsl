@@ -21,7 +21,6 @@ Protocole TSL 5.0 (offsets vérifiés sur le fil VSM, capture 2026-06-30) :
 INDEX = display index (la source). CONTROL bits : 0-1=RH, 2-3=TT, 4-5=LH (0=off 1=red 2=green 3=amber)
 """
 import json
-from app.numerotation import cle_input
 import logging
 import socket
 import struct
@@ -30,37 +29,89 @@ import time
 
 log = logging.getLogger(__name__)
 
-TSL_SOM          = b"\xfe\x02"
-TSL_SLOT_TTL_F   = 2.5
-TSL_SLOT_TTL_MIN = 0.05
+# ─── LE MODÈLE DE TALLY VIT DANS `app/tally.py` ─────────────────────────────────────────
+# ★ CE MODULE N'EST PLUS QU'UN ADAPTATEUR DE PROTOCOLE. Le modèle — niveaux, contributions
+# cumulées, propagation dans le graphe, résolution de référence — était ici parce que c'est
+# TSL qui l'a fait naître. Conséquence : `services/nmos/is07*.py` importait TSL pour poser son
+# tally, donc supprimer TSL aurait emporté IS-07. Le protocole qu'on remplace tenait le modèle.
+#
+# ⚠ CES RÉEXPORTS SONT UNE PASSERELLE, PAS UNE API. Ils existent pour qu'aucun appelant ne
+# casse pendant la migration. Tout NOUVEAU code vise `app.tally` directement ; les appelants
+# existants y sont déplacés un par un, et ce bloc disparaîtra quand il n'en restera aucun.
+from app import tally as _tally
+from app.tally import (
+    # l'état, en deux couches
+    _lock, _tally_par_source, _tally_state, _tally_dirty,   # lus par les BANCS
+    _cumul_des_sources, _poser_cases, poser_tally, poser_cases,
+    sources_du_tally, get_tally_state, get_tally_level, etat_brut,
+    attendre_changement, signaler_changement, acquitter_changement,
+    # cumul et propagation
+    cumuler, _CUMUL, propager, _entrees_contributives, _producteur_de,
+    _CONTRIBUTION, _PROFONDEUR_MAX,
+    # résolution de source
+    resolve_ref, _ports_cache, _ports_snapshot, _port_shm,
+    # registre des porteurs
+    enregistrer_porteur, retirer_porteur, liste_porteurs, porteur_pour,
+    rafraichir_porteurs_projets, index_chez, ref_chez,
+    noms_colonnes, nb_colonnes_actives, NOMS_COLONNES_DEFAUT,
+    # les deux fils et ce qu'ils utilisent — lus par les BANCS
+    _sortie_a_l_antenne, _plg_wiring, _mixer_publisher_tick, _distributor,
+    demarrer, arreter, fils_actifs,
+)
 
-# ─── État global ───────────────────────────────────────────────────────────────
-_lock       = threading.Lock()
-_dist_thr   = None
-_stop_evt   = threading.Event()
+# ⚠ Ces noms sont RÉEXPORTÉS, donc « inutilisés » pour un analyseur statique. `__all__` le lui
+# dit — sans quoi pyflakes rend 23 remarques à chaque passage et on apprend à les ignorer.
+__all__ = [
+    "poser_tally", "poser_cases", "sources_du_tally", "get_tally_state", "get_tally_level",
+    "etat_brut", "attendre_changement", "signaler_changement", "acquitter_changement",
+    "cumuler", "propager", "resolve_ref",
+    "enregistrer_porteur", "retirer_porteur", "liste_porteurs", "porteur_pour",
+    "rafraichir_porteurs_projets", "index_chez", "ref_chez",
+    "noms_colonnes", "nb_colonnes_actives", "NOMS_COLONNES_DEFAUT",
+    "_sortie_a_l_antenne", "_plg_wiring", "_mixer_publisher_tick", "_distributor",
+    "demarrer", "arreter", "fils_actifs",
+    "start_all", "stop_all", "reload", "start", "stop", "is_running",
+    "status_dict", "connections_status", "encode_tsl_frame", "build_control",
+    "noms_colonnes", "nb_colonnes_actives", "action_options", "run_action",
+    "register_routes",
+    # ⚠ Des noms PRIVÉS, et c'est assumé : onze bancs les lisent (`_tally_state`,
+    # `_PROFONDEUR_MAX`, `_entrees_contributives`…). Les retirer du pont ferait échouer des
+    # tests qui vérifient de vraies propriétés, pour un gain d'esthétique. Ils partiront avec
+    # les bancs, quand ceux-ci viseront `app.tally`.
+    "_tally_par_source", "_tally_state", "_tally_dirty", "_lock",
+    "_cumul_des_sources", "_poser_cases", "_CUMUL", "_CONTRIBUTION", "_PROFONDEUR_MAX",
+    "_entrees_contributives", "_producteur_de", "_ports_cache", "_ports_snapshot", "_port_shm",
+]
 
-# ═══ L'ÉTAT DU TALLY, EN DEUX COUCHES ═════════════════════════════════════════════════════════
-#
-# ★ PLUSIEURS SOURCES PEUVENT SERVIR LE MÊME NIVEAU, et c'est un cas voulu : deux contrôleurs
-# broadcast sur une même chaîne de destination, un émetteur TSL doublé par un Receiver IS-07, un
-# mélangeur qui complète ce qu'un pupitre externe annonce. Une seule couche ne pouvait pas
-# l'exprimer : le dernier écrivain écrasait les autres, et surtout, une source qui repasse au vert
-# écrivait « off » sur le rouge d'une AUTRE — un tally qui s'éteint sans que personne ne l'ait
-# demandé, sur une fonction d'antenne.
-#
-#   `_tally_par_source[(index, niveau)][source]` — ce que CHAQUE source affirme. Une source
-#   remplace toujours sa contribution ENTIÈRE (`poser_tally`), jamais case par case : sinon un
-#   signal qui sort du programme garderait son rouge, faute d'un « off » explicite.
-#
-#   `_tally_state[(index, niveau)]` — le CUMUL, seul lu par les consommateurs. Rouge + vert donne
-#   l'ambre, exactement comme deux contributions d'un même mélangeur.
-_tally_par_source: dict = {}
-_tally_state: dict = {}
-_tally_dirty = threading.Event()
+# Propres au service : le verrou des CONNEXIONS, distinct de celui du modèle (cf. app/tally.py).
+_lock_conn = threading.Lock()
+_dist_thr  = None
+_stop_evt  = threading.Event()
 
 # _connections : {conn_id: _TslServer}
 _connections: dict = {}
 
+
+def _invalider_mapping(cid=None):
+    """Le mapping vient de changer : les serveurs concernés re-traduisent ce qu'ils affirment.
+
+    Sans cet appel, un tally déjà reçu resterait accroché à la source qu'il désignait AVANT
+    l'édition — un serveur TSL n'émettant que sur changement, rien ne viendrait le corriger."""
+    with _lock_conn:
+        cibles = [srv for c, srv in _connections.items()
+                  if (cid is None or int(c) == int(cid)) and hasattr(srv, "invalider_mapping")]
+    for srv in cibles:
+        try:
+            srv.invalider_mapping()
+        except Exception:
+            pass
+    signaler_changement()
+
+
+
+TSL_SOM          = b"\xfe\x02"
+TSL_SLOT_TTL_F   = 2.5
+TSL_SLOT_TTL_MIN = 0.05
 
 # ─── Parser TSL 5.0 ────────────────────────────────────────────────────────────
 def _tsl_color(val):
@@ -73,44 +124,6 @@ _COLOR_CODE = {"off": 0, "red": 1, "green": 2, "amber": 3}
 _OFF_FIELD  = {"lh": 0, "rh": 1, "tt": 2}
 
 
-# ─── Ports virtuels de projet (chantier 4/5) ──────────────────────────────────
-# Un mapping/label peut référencer "port:<id>" au lieu d'un shm brut : l'adresse reste
-# stable côté contrôleur broadcast, le binding du port suit les rebinds/chargements.
-_ports_cache = {"ts": 0.0, "by_id": {}, "by_pid": {}}
-
-def _ports_snapshot():
-    import time as _t
-    now = _t.monotonic()
-    if now - _ports_cache["ts"] > 3.0:
-        try:
-            from app.database import db_project_ports
-            ports = db_project_ports(None)
-        except Exception:
-            ports = []
-        _ports_cache["by_id"] = {p["id"]: p for p in ports}
-        by_pid: dict = {}
-        for p in ports:
-            by_pid.setdefault(p["project_id"], []).append(p)
-        _ports_cache["by_pid"] = by_pid
-        _ports_cache["ts"] = now
-    return _ports_cache
-
-def _port_shm(port):
-    """shm réel d'un port : binding.shm (source) ou binding.internal_shm (destination)."""
-    b = (port or {}).get("binding") or {}
-    return (b.get("shm") if (port or {}).get("kind") == "source"
-            else b.get("internal_shm")) or None
-
-def resolve_ref(ref):
-    """"port:<id>" → shm réel du binding ; sinon renvoie ref tel quel."""
-    ref = (ref or "").strip()
-    if ref.startswith("port:"):
-        try:
-            port = _ports_snapshot()["by_id"].get(int(ref[5:]))
-        except (TypeError, ValueError):
-            port = None
-        return _port_shm(port)
-    return ref
 
 
 # ─── Encodeur TSL 5.0 (miroir du parser — offsets vérifiés sur le fil VSM) ────
@@ -173,6 +186,14 @@ class _TslServer:
         self.last_change        = None   # ts
         self.last_change_idx    = None
         self.last_change_colors = None   # {"lh","rh","tt"}
+
+        # Ce que CE serveur affirme, indexé par index de TRAME. C'est la seule mémoire du
+        # protocole : le modèle, lui, est adressé par source. On la garde parce qu'un
+        # changement de mapping doit re-router un tally déjà reçu, alors qu'un serveur TSL
+        # ne réémet pas spontanément — il n'envoie que sur changement.
+        self._brut = {}
+        self._map_cache = None
+        self._map_exp   = 0.0
         # keepalive tracker : (index, 'rh'|'tt'|'lh') → [value, ts, interval_s]
         self._slots: dict    = {}
         self._combined: dict = {}
@@ -191,6 +212,57 @@ class _TslServer:
         self._thread = None
         with self._lock:
             self.running = False
+
+    def _mapping(self):
+        """index de trame → référence de source, mémorisé quelques secondes.
+
+        Un serveur TSL peut recevoir des dizaines de trames par seconde ; relire la table à
+        chaque trame la ferait payer au réseau. `invalider_mapping()` force la relecture dès
+        que quelqu'un édite le mapping — le cache ne masque donc jamais une modification."""
+        now = time.monotonic()
+        with self._lock:
+            if self._map_cache is not None and now < self._map_exp:
+                return self._map_cache
+        try:
+            from app.database import db_get_tsl_mapping
+            m = {int(r["tsl_index"]): (r.get("source_shm") or "")
+                 for r in db_get_tsl_mapping(self.conn_id)}
+        except Exception:
+            m = {}
+        with self._lock:
+            self._map_cache, self._map_exp = m, now + 2.0
+        return m
+
+    def invalider_mapping(self):
+        with self._lock:
+            self._map_cache = None
+        self._republier()
+
+    def _republier(self):
+        """Traduit ce que ce serveur affirme (par index de TRAME) en cases du modèle (par
+        SOURCE), et republie sa contribution ENTIÈRE.
+
+        ★ Entière, et c'est le point. Un index qui perd son mapping disparaît de l'ensemble
+        posé, donc s'éteint — alors qu'une pose case-par-case l'aurait laissé figé sur la
+        source qu'il désignait avant. C'est exactement la panne vue en production sur PiP4.
+
+        C'est ici, et NULLE PART AILLEURS, que l'index TSL touche le tally : au-delà de cette
+        méthode, le protocole n'existe plus. Le jour où l'on passe en IS-07, c'est ce seul
+        traducteur qui disparaît."""
+        mapping = self._mapping()
+        with self._lock:
+            brut = {i: dict(c) for i, c in self._brut.items()}
+        cases = {}
+        for idx, colors in brut.items():
+            ref = _tally.resolve_ref(mapping.get(idx) or "")
+            if not ref:
+                continue          # index non mappé : il ne désigne aucune source, il n'allume rien
+            for lvl, color in colors.items():
+                cle = (ref, lvl)
+                # Deux index de trame peuvent viser la même source : on cumule au lieu
+                # d'écraser, sinon le dernier index lu gagnerait arbitrairement.
+                cases[cle] = _tally.cumuler(cases.get(cle), color)
+        return poser_tally("tsl:%s" % self.conn_id, cases, reveiller=False)
 
     def _apply_tsl(self, index: int, control: int, text: str):
         rh = control & 0x03
@@ -258,11 +330,9 @@ class _TslServer:
                 colors = {self.niveau: ("amber" if rouge and vert else
                                         "red" if rouge else "green" if vert else "off")}
 
-        # La contribution de CE serveur pour CET index. On ne remplace pas sa contribution
-        # entière (les autres index qu'il tallye restent), mais bien sa case à lui : un serveur
-        # TSL reçoit ses index un par un, chaque trame ne parlant que d'un seul.
-        changed = _poser_cases("tsl:%s" % self.conn_id,
-                               {(index, lvl): color for lvl, color in colors.items()})
+        with self._lock:
+            self._brut[index] = dict(colors)
+        changed = self._republier()
         if changed:
             _tally_dirty.set()
             with self._lock:
@@ -423,9 +493,8 @@ class _TslClient:
 
     def _frames(self, force=False):
         """Trames à émettre pour l'état courant (diff contre _last_sent)."""
-        from app.database import db_get_tsl_mapping, db_get_source_label_for_shm
-        with _lock:
-            state = dict(_tally_state)
+        from app.database import db_get_tsl_mapping
+        state = etat_brut()          # le modèle prend SON verrou
         # UN niveau, plusieurs ÉTATS. `rouge_field`/`vert_field` ne choisissent pas DEUX
         # niveaux : ils disent dans quel champ de la trame l'afficheur d'en face attend le rouge
         # et dans lequel il attend le vert. C'est un choix de câblage de l'afficheur, pas une
@@ -439,18 +508,17 @@ class _TslClient:
         for m in mapping:
             idx = int(m.get("tsl_index") or 0)
             ref = (m.get("source_shm") or "").strip()
-            etat  = state.get((idx, lvl), "off") if lvl else "off"
+            # ★ C'EST ICI QUE L'INDEX NAÎT, au dernier moment, pour la trame et pour elle seule.
+            # L'état est lu PAR SOURCE ; le mapping ne sert qu'à savoir sous quel numéro
+            # l'afficheur d'en face attend ce signal. Le modèle, lui, n'a jamais vu ce numéro.
+            etat  = state.get((_tally.resolve_ref(ref) or ref, lvl), "off") if lvl else "off"
             red   = etat in ("red", "amber")
             green = etat in ("green", "amber")
             control = build_control(red, green, self.rouge_field, self.vert_field)
-            try:
-                text = db_get_source_label_for_shm(ref, self.label_col) or ""
-                if not text and ref.startswith("port:"):
-                    resolved = resolve_ref(ref)
-                    if resolved:
-                        text = db_get_source_label_for_shm(resolved, self.label_col) or ""
-            except Exception:
-                text = ""
+            # Pas de repli de colonne sur le fil : un UMD physique est câblé sur UNE colonne, et
+            # lui envoyer le contenu d'une autre parce que la sienne est vide serait mentir sur
+            # ce qu'affiche l'écran. Le repli n'a lieu que pour nos propres afficheurs.
+            text = _tally.libelle_de(ref, self.label_col, replier=False)
             if force or self._last_sent.get(idx) != (control, text):
                 out.append((idx, control, text))
                 self._last_sent[idx] = (control, text)
@@ -496,639 +564,31 @@ class _TslClient:
 # Résolution entrée mixer → shm → PORT du projet → index (= port.ord).
 
 _mixer_pub_thr = None
-# Dernier `/state` connu de chaque mélangeur, DÉPOSÉ par l'émetteur qui l'interroge déjà toutes
-# les 0,3 s. La propagation le relit : refaire la requête depuis le distributeur doublerait le
-# trafic vers les conteneurs pour la même information, à la même fraîcheur.
-_etat_mixer: dict = {}
-
-
-def _plg_wiring(type_, hostname, params):
-    from app import plugins as _plg
-    return _plg.derive_wiring(type_, hostname, params) or {}
-
-def _sortie_a_l_antenne(ct, niveaux, idx_for):
-    """La sortie PGM de ce mélangeur porte-t-elle un tally, sur les niveaux de SA production ?
-
-    ★ SUR SES NIVEAUX À LUI, pas sur n'importe lesquels. Le système fait tourner plusieurs
-    productions en même temps, chacune possédant ses niveaux (`tally_levels.owner_*`) :
-    « à l'antenne » n'a de sens que rapporté à une production. Regarder tous les niveaux ferait
-    qu'un mélangeur de la production 2 s'allume parce qu'un signal homonyme est à l'antenne
-    sur la production 5.
-
-    C'est la sortie **PGM** qui décide — `CLEAN` et `PVW` ne disent rien de la diffusion.
-    Renvoie False si on ne sait pas : ne pas savoir n'est pas une raison d'allumer un rouge."""
-    import json as _json
-    try:
-        from app import plugins as _plg
-        dc = ct.get("deploy_config")
-        dc = _json.loads(dc) if isinstance(dc, str) else (dc or {})
-        # ⚠ AVEC LES PARAMS. `derive_wiring` déplie les ports `repeat` sur eux : sans params, un
-        # plugin dont les sorties se déplient (`repeat: "video_channels"`) renvoie une liste VIDE,
-        # et la garde bloquerait son émission pour toujours. Le mélangeur y échappait parce que
-        # ses trois sorties sont statiques — c'est une coïncidence, pas une propriété.
-        w = _plg.derive_wiring(dc.get("type"), ct.get("hostname"), dc.get("params") or {}) or {}
-        prod = w.get("produces") or []
-        pgm = next((p for p in prod if (p.get("label") or "").upper() == "PGM"), None) or \
-            (prod[0] if prod else None)
-        shm = (pgm or {}).get("shm")
-        if not shm:
-            return False
-        idx = idx_for(shm)
-        if idx is None:
-            return False
-        with _lock:
-            return any(_tally_state.get((idx, n)) == "red" for n in (niveaux or ()))
-    except Exception as e:
-        log.debug("TSL: propagation — sortie de %s indéterminable (%s)", ct.get("vmid"), e)
-        return False
-
-
-_CUMUL = {frozenset(("red", "green")): "amber"}
-
-def cumuler(a, b):
-    """Cumul de deux états sur UN MÊME niveau. Rouge + vert = ambre.
-
-    ⚠ Ce n'est pas « PGM + PVW = orange » : rien ici ne connaît de bus. Deux CONTRIBUTIONS
-    arrivent sur le même niveau pour le même index, et un niveau a plusieurs états dont l'un
-    exprime la coexistence. C'est ce cumul, et lui seul, qui produit l'orange que voit
-    l'exploitant quand une source est à la fois au programme et en préparation."""
-    a, b = a or "off", b or "off"
-    if a == "off":  return b
-    if b == "off":  return a
-    if a == b:      return a
-    return _CUMUL.get(frozenset((a, b)), "amber")
-
-def _mixer_publisher():
-    import requests as _req
-    from app.database import db_get_containers, db_get_projects, db_get_tsl_connections
-    while not _stop_evt.is_set():
-        try:
-            _mixer_publisher_tick(_req, db_get_containers, db_get_projects,
-                                  db_get_tsl_connections)
-        except Exception as e:
-            log.debug(f"TSL mixer publisher: {e}")
-        if _stop_evt.wait(timeout=0.3):
-            break
-
-def _mixer_publisher_tick(_req, db_get_containers, db_get_projects,
-                          db_get_tsl_connections):
-    from app.metrics import get_container_ip
-    # `db_get_projects` / `db_get_tsl_connections` restent dans la signature : l'appelant les
-    # injecte, et les bancs s'en servent. Depuis le dénouement, les niveaux d'un mélangeur se
-    # lisent sur `tally_levels`, plus en recoupant les bases des uns et des autres.
-    ports_by_pid = _ports_snapshot()["by_pid"]
-    changed = False
-    for ct in db_get_containers():
-        dc_raw = ct.get("deploy_config")
-        if not dc_raw:
-            continue
-        try:
-            dc = json.loads(dc_raw) if isinstance(dc_raw, str) else dc_raw
-        except Exception:
-            continue
-        if (dc.get("type") or "") != "mixer":
-            continue
-        params = dc.get("params") or {}
-        if not params.get("tally_emit"):
-            continue
-        # NIVEAUX de ce mélangeur : ceux qu'il déclare, sinon ceux de sa production. C'est une
-        # LISTE depuis le dénouement — le cas « un seul » n'est que la liste à un élément.
-        from app.database import db_get_tally_levels_of
-        pid = ct.get("project_id")
-        niveaux = params.get("tally_level_base") or []
-        if not isinstance(niveaux, list):
-            niveaux = [niveaux]
-        if not niveaux:
-            niveaux = db_get_tally_levels_of("project", pid)
-        if not niveaux:
-            continue
-        try:
-            ip = get_container_ip(ct["vmid"])
-            if not ip:
-                continue
-            st = _req.get(f"http://{ip}:8082/state", timeout=0.8).json()
-        except Exception:
-            continue
-        _etat_mixer[ct["vmid"]] = st
-        pgm, pvw = st.get("pgm"), st.get("pvw")
-        shm_pgm = (st.get(cle_input(pgm)) or "") if pgm is not None else ""
-        shm_pvw = (st.get(cle_input(pvw)) or "") if pvw is not None else ""
-        # shm → index via les ports du projet (binding.shm == shm → ord)
-        def _idx_for(shm):
-            if not shm:
-                return None
-            for p in ports_by_pid.get(pid, []):
-                if p.get("kind") == "source" and _port_shm(p) == shm:
-                    return int(p.get("ord") or 0)
-            return None
-        want = {}
-        def _poser(idx, couleur):
-            """Pose une contribution sur TOUS les niveaux du mélangeur, en cumulant."""
-            for lvl in niveaux:
-                cle = (idx, lvl)
-                want[cle] = cumuler(want.get(cle), couleur)
-        # ★ LE TALLY SE PROPAGE : un mélangeur ne tallye ses entrées que si SA PROPRE SORTIE est
-        # à l'antenne. Jusqu'ici l'émission était inconditionnelle — un mélangeur de préparation
-        # allumait un rouge sur une caméra qui n'était diffusée nulle part. C'est le premier étage
-        # du chantier « TALLY : le calculer par propagation » (TODO.md).
-        #
-        # `tally_force` (défaut VRAI) conserve l'ancien comportement : on livre la correction pour
-        # tous, mais un site dont la sortie de mélangeur n'est mappée nulle part perdrait sinon
-        # son tally du jour au lendemain, sans avoir rien demandé — sur une fonction d'antenne.
-        # Le décocher, c'est demander la propagation.
-        if not params.get("tally_force", True) and not _sortie_a_l_antenne(ct, niveaux, _idx_for):
-            want = {}
-        else:
-            i_pgm, i_pvw = _idx_for(shm_pgm), _idx_for(shm_pvw)
-            # ★ MÊME NIVEAU pour les deux. Avant le dénouement, le rouge et le vert partaient sur
-            # DEUX niveaux distincts (le 1er et le 2nd du mélangeur) : une source au programme ET
-            # en préparation occupait deux entrées qui ne se rencontraient jamais, et c'est
-            # l'afficheur qui recomposait l'orange en lisant les deux champs de la trame. Le cumul
-            # a désormais lieu ICI, sur le niveau — donc IS-07 et le multiview le voient aussi.
-            if i_pgm is not None:
-                _poser(i_pgm, "red")
-            if i_pvw is not None:
-                _poser(i_pvw, "green")
-        # ★ REMPLACEMENT INTÉGRAL, PAR MÉLANGEUR. `poser_tally` retire tout ce que CE mélangeur
-        # avait posé et qu'il ne pose plus — un changement de PGM éteint donc l'ancienne source —
-        # sans jamais toucher à ce qu'un autre écrivain affirme sur les mêmes clés.
-        if poser_tally("mixer:%s" % ct["vmid"], want, reveiller=False):
-            changed = True
-    if changed:
-        _tally_dirty.set()
-
-
-# ══════════════════════════════════════════════════════════════════════════════════════════════
-# PROPAGATION du tally — remonter le graphe depuis les sorties à l'antenne
-# ══════════════════════════════════════════════════════════════════════════════════════════════
-# La règle, en une ligne :
-#
-#     tally(entrée d'un élément) = tally(sortie de cet élément) ET (cette entrée CONTRIBUE)
-#
-# La récursion part des flux qu'un ÉMETTEUR a tallyés — aujourd'hui un contrôleur broadcast (VSM)
-# via TSL, demain un Receiver IS-07 — et remonte le graphe de câblage (`derive_wiring`).
-#
-# ★ « CONTRIBUE » DÉPEND DU TYPE, et ce qu'on ne sait pas ne propage RIEN. Un élément traversant
-#   (delay, correcteur, UDC) contribue toujours : sa sortie EST son entrée, transformée. Un
-#   mélangeur ne contribue que par sa source PGM. Un DVE ne contribue que par ses sources
-#   VISIBLES — et il ne sait pas encore le dire, donc il ne propage rien.
-#
-#   Inventer une contribution allumerait un rouge sur une source qui n'est pas à l'antenne : c'est
-#   exactement le défaut qu'on corrige, à l'envers. `_CONTRIBUTION` est donc une liste FERMÉE, et
-#   tout type absent vaut « je ne sais pas » — pas « tout ».
-#
-# ⚠ PLAFOND DE PROFONDEUR. Le graphe MXL peut boucler (une sortie recâblée sur une entrée en
-#   amont, un aller-retour d'incrustation). Sans plafond, la propagation ne rendrait jamais la
-#   main — et elle tourne dans la boucle du distributeur.
-
-_PROFONDEUR_MAX = 12
-
-# Ce qui contribue à la sortie d'un élément, PAR TYPE. Liste fermée : un type absent ne propage
-# rien. Voir TODO.md § TALLY pour les deux familles qui manquent encore (mélangeur configurable,
-# DVE), différées parce qu'elles demandent de toucher des plugins.
-_CONTRIBUTION = {
-    "delay":            "toutes",
-    "color_corrector":  "toutes",
-    "udc":              "toutes",
-    "avsync":           "toutes",
-    "transcoder":       "toutes",
-    "v210_bridge":      "toutes",
-    "mixer":            "pgm",
-}
-
-
-def _producteur_de(shm, par_shm):
-    return par_shm.get(shm)
-
-
-def _entrees_contributives(ct, dc, etat_ctrl):
-    """Les shm d'entrée qui contribuent à la sortie de ce conteneur. [] si on ne sait pas.
-
-    `etat_ctrl` = le `/state` du conteneur, ou None. Un mélangeur ne contribue que par sa source
-    PGM : sans son état, on ne SAIT pas laquelle — et on ne propage rien plutôt que de deviner."""
-    from app import plugins as _plg
-    from app.numerotation import cle_input
-    regle = _CONTRIBUTION.get(dc.get("type") or "")
-    if not regle:
-        return []
-    params = dc.get("params") or {}
-    w = _plg.derive_wiring(dc.get("type"), ct.get("hostname"), params) or {}
-    entrees = []
-    for p in (w.get("consumes") or []):
-        if (p.get("essence") or "video") != "video":
-            continue
-        shm = (params.get(p.get("state_field") or "") or "").strip()
-        if shm:
-            entrees.append(shm)
-    if regle == "toutes":
-        return entrees
-    if regle == "pgm":
-        if not etat_ctrl:
-            return []
-        pgm = etat_ctrl.get("pgm")
-        if pgm is None:
-            return []
-        # Le câblage vient de l'ÉTAT VIVANT, comme dans `_mixer_publisher_tick` : c'est lui qui
-        # sait sur quoi le mélangeur est réellement branché à cet instant. Les params ne servent
-        # que de repli — ils peuvent être en retard d'un câblage à chaud.
-        shm = (etat_ctrl.get(cle_input(pgm)) or params.get(cle_input(pgm)) or "").strip()
-        return [shm] if shm else []
-    return []
-
-
-def propager(etat, par_shm, idx_de, etat_ctrl_de):
-    """{(index, niveau): couleur} À AJOUTER par propagation. Ne modifie rien.
-
-    `par_shm`       : shm produit → (conteneur, deploy_config)
-    `idx_de`        : callable(shm, niveau) → index TSL, ou None. Une CALLABLE et non un dict :
-                      l'index d'un flux dépend du PORTEUR du niveau — deux porteurs peuvent
-                      employer le même index pour des sources différentes, et une table à plat
-                      ferait propager sur le mauvais signal.
-    `etat_ctrl_de`  : vmid → `/state` du conteneur, ou None
-
-    Renvoie un dict SÉPARÉ plutôt que d'écrire dans `_tally_state` : l'appelant doit pouvoir
-    distinguer ce qu'un émetteur a dit de ce que nous avons déduit. Sans cette séparation, un
-    tally propagé deviendrait indiscernable d'un tally reçu au tour suivant, et se propagerait
-    à son tour — la boucle se referme sur elle-même."""
-    ajouts = {}
-    # File des (shm à l'antenne, niveau, couleur) à remonter.
-    file = []
-    for (idx, niveau), couleur in (etat or {}).items():
-        if couleur == "off":
-            continue
-        for shm in (par_shm or {}):
-            if idx_de(shm, niveau) == idx:
-                file.append((shm, niveau, couleur, 0))
-    vus = set()
-    while file:
-        shm, niveau, couleur, prof = file.pop()
-        if prof >= _PROFONDEUR_MAX or (shm, niveau) in vus:
-            continue
-        vus.add((shm, niveau))
-        cible = _producteur_de(shm, par_shm)
-        if not cible:
-            continue
-        ct, dc = cible
-        for amont in _entrees_contributives(ct, dc, etat_ctrl_de.get(ct.get("vmid"))):
-            idx_amont = idx_de(amont, niveau)
-            if idx_amont is None:
-                continue          # une source sans index n'est adressable par personne
-            cle = (idx_amont, niveau)
-            if (etat or {}).get(cle, "off") == "off" and ajouts.get(cle, "off") == "off":
-                ajouts[cle] = couleur
-            file.append((amont, niveau, couleur, prof + 1))
-    return ajouts
-
-
-def _distributor():
-    """Pousse tally + texte label vers chaque multiview selon sa flux_config."""
-    import requests as _req
-    from app.database import (db_get_containers, db_get_source_label_for_shm,
-                               db_get_setting, db_get_tsl_connections,
-                               db_get_tsl_mappings_all)
-    _last_push: dict = {}   # vmid → (dernier payload poussé, ts) — anti-repush identique (cf. plus bas)
-
-    while not _stop_evt.is_set():
-        _tally_dirty.wait(timeout=0.1)
-        if _stop_evt.is_set():
-            break
-        _tally_dirty.clear()
-
-        with _lock:
-            state = dict(_tally_state)
-
-        try:
-            containers = db_get_containers()
-            # PORTEURS de niveaux : les connexions ENTRANTES actives (les sortantes consomment
-            # l'état, elles ne le servent pas) et les productions. Depuis le dénouement, chacun
-            # POSSÈDE ses niveaux — on ne les recoupe plus par une bande commune, et deux
-            # porteurs ne peuvent plus se disputer un niveau par construction.
-            from app.database import db_get_tally_levels_of, db_get_projects
-            porteurs = []
-            for c in db_get_tsl_connections():
-                if not c.get("enabled") or (c.get("direction") or "in") != "in":
-                    continue
-                porteurs.append({"_key": int(c.get("id") or 0),
-                                 "niveaux": [c.get("level_uuid")], "_project": None})
-            # Pseudo-porteurs PAR PRODUCTION : l'écrivain est l'émetteur du mélangeur, et
-            # l'index d'une source est son port (ord).
-            try:
-                for pr in db_get_projects():
-                    niv = db_get_tally_levels_of("project", pr["id"])
-                    if not niv:
-                        continue
-                    porteurs.append({"_key": "proj:%s" % pr["id"], "niveaux": niv,
-                                     "_project": pr["id"]})
-            except Exception:
-                pass
-            # niveau → porteur : c'est par là que le multiview retrouve qui sert son niveau.
-            porteur_de_niveau = {}
-            for pt in porteurs:
-                for n in pt["niveaux"]:
-                    if n:
-                        porteur_de_niveau.setdefault(n, pt)
-
-            def _porteur_pour(niveaux):
-                """(niveau servi, porteur) pour une demande — le premier niveau demandé dont
-                quelqu'un écrit l'état.
-
-                ★ LE NIVEAU DEMANDÉ EST LE NIVEAU LU. Avant le dénouement, on retrouvait le
-                porteur puis on RE-CHOISISSAIT deux de ses trois niveaux via `rouge_field`/
-                `vert_field` : le niveau demandé ne servait qu'à désigner le porteur, et pouvait
-                n'être lu par personne. Le rouge et le vert sont maintenant deux ÉTATS du même
-                niveau, et les champs TSL ne concernent plus que la mise sur le fil."""
-                for _n in (niveaux or ()):
-                    _pt = porteur_de_niveau.get(_n)
-                    if _pt:
-                        return _n, _pt
-                return None, None
-            # En central l'index TSL d'un PiP est déduit de SA source : lookup inverse
-            # (connexion, source_shm RÉSOLU) → tsl_index. Un mapping peut référencer
-            # "port:<id>" — résolu vers le shm bindé ; le label garde la ref d'origine.
-            idx_by_conn_shm: dict = {}
-            label_ref: dict = {}      # (conn_key, shm_résolu) → ref d'origine (labels)
-            for m in db_get_tsl_mappings_all():
-                ref = (m.get("source_shm") or "").strip()
-                if not ref:
-                    continue
-                shm_m = resolve_ref(ref) or ref
-                key = (int(m.get("connection_id") or 0), shm_m)
-                idx_by_conn_shm[key] = int(m.get("tsl_index") or 0)
-                if ref != shm_m:
-                    label_ref[key] = ref
-            # Ports des pseudo-porteurs projet : index d'une source = son port (ord).
-            for c in porteurs:
-                pidc = c.get("_project")
-                if not pidc:
-                    continue
-                for p in _ports_snapshot()["by_pid"].get(pidc, []):
-                    shm_p = _port_shm(p)
-                    if shm_p:
-                        key = (c["_key"], shm_p)
-                        idx_by_conn_shm[key] = int(p.get("ord") or 0)
-                        label_ref[key] = f"port:{p['id']}"
-            # Niveaux par projet : défaut d'un conteneur qui n'en déclare pas.
-            try:
-                proj_niv = {pr["id"]: db_get_tally_levels_of("project", pr["id"])
-                            for pr in db_get_projects()}
-            except Exception:
-                proj_niv = {}
-
-            # ── PROPAGATION : remonter le graphe depuis les flux à l'antenne ──────────────
-            # Ses déductions s'ajoutent à `state` POUR CE TOUR seulement, jamais à
-            # `_tally_state`. C'est ce qui empêche la boucle : un tally propagé qu'on écrirait
-            # dans l'état deviendrait, au tour suivant, indiscernable d'un tally REÇU, et se
-            # propagerait à son tour d'un cran de plus, indéfiniment.
-            try:
-                par_shm = {}
-                for _ct in containers:
-                    _dc = _ct.get("deploy_config")
-                    _dc = json.loads(_dc) if isinstance(_dc, str) else (_dc or {})
-                    if not _dc:
-                        continue
-                    _w = _plg_wiring(_dc.get("type"), _ct.get("hostname"), _dc.get("params") or {})
-                    for _p in (_w.get("produces") or []):
-                        _shm = (_p.get("shm") or "").strip()
-                        if _shm:
-                            par_shm.setdefault(_shm, (_ct, _dc))
-
-                def _idx_de(shm, niveau):
-                    """Index de ce flux CHEZ LE PORTEUR du niveau — deux porteurs peuvent
-                    employer le même index pour des sources différentes."""
-                    pt = porteur_de_niveau.get(niveau)
-                    if not pt:
-                        return None
-                    return idx_by_conn_shm.get((pt["_key"], resolve_ref(shm) or shm))
-
-                deduits = propager(state, par_shm, _idx_de, _etat_mixer)
-                for _k, _v in deduits.items():
-                    state.setdefault(_k, _v)
-            except Exception as e:
-                log.debug("TSL: propagation ignorée ce tour (%s)", e)
-        except Exception:
-            continue
-
-        updates_by_vmid: dict = {}
-        overlays_by_vmid: dict = {}
-        for ct in containers:
-            dc_raw = ct.get("deploy_config")
-            if not dc_raw:
-                continue
-            try:
-                dc = json.loads(dc_raw) if isinstance(dc_raw, str) else dc_raw
-            except Exception:
-                continue
-            type_ct = (dc.get("type") or "")
-            if type_ct != "multiview":
-                # ── AUTRES PLUGINS : le plugin DIT ce qu'il veut voir allumé ──────────────
-                # ★ UN HOOK, PAS UNE BRANCHE PAR TYPE. Le distributeur connaissait un seul
-                # modèle de données (`flux_config` du mur) ; chaque plugin qui voudrait du
-                # tally aurait ajouté ici sa propre lecture, et ce fichier serait devenu un
-                # catalogue de modèles étrangers. Le plugin déclare `tally_targets` et rend
-                # une liste plate : le distributeur ne sait plus rien de personne.
-                #
-                # ⚠ LE MUR RESTE SUR SON CHEMIN. C'est le plus sensible du produit et il
-                # tourne : on ne le fait pas passer sur du code neuf pour l'élégance.
-                try:
-                    from app import plugins as _plug
-                    _h = _plug.get_hook(type_ct, "tally_targets")
-                except Exception:
-                    _h = None
-                if not _h:
-                    continue
-                try:
-                    cibles = _h(dc.get("params") or {},
-                                {"vmid": ct["vmid"], "project_id": ct.get("project_id")}) or []
-                except Exception:
-                    continue
-                for cible in cibles:
-                    if not isinstance(cible, dict):
-                        continue
-                    shm_c = (cible.get("shm") or "").strip()
-                    if shm_c.startswith("/dev/shm/"):
-                        shm_c = shm_c[len("/dev/shm/"):]
-                    if not shm_c:
-                        continue
-                    # Niveaux demandés par le plugin : liste d'identifiants, vide = ceux de
-                    # son projet. Le champ garde son nom historique `niveau`, mais ce n'est plus
-                    # un numéro de bande.
-                    niv_c = cible.get("niveau") or []
-                    if not isinstance(niv_c, list):
-                        niv_c = [niv_c]
-                    if not niv_c:
-                        niv_c = proj_niv.get(ct.get("project_id")) or []
-                    lvl_c, conn_c = _porteur_pour(niv_c)
-                    # LE TEXTE EST RÉSOLU MÊME SANS NIVEAU DE TALLY. Un scope peut vouloir le
-                    # libellé vivant d'une source sans jamais l'allumer en rouge — et c'est
-                    # même le cas courant : un instrument n'est pas à l'antenne.
-                    try:
-                        txt_c = db_get_source_label_for_shm(
-                            shm_c, int(cible.get("label_col") or 0))
-                    except Exception:
-                        txt_c = ""
-                    coul_r = coul_v = "off"
-                    if conn_c:
-                        ck_c = conn_c.get("_key", int(conn_c.get("id") or 0))
-                        ti = idx_by_conn_shm.get((ck_c, shm_c))
-                        if ti is not None:
-                            _e = state.get((ti, lvl_c), "off")
-                            coul_r = "red"   if _e in ("red", "amber")   else "off"
-                            coul_v = "green" if _e in ("green", "amber") else "off"
-                    updates_by_vmid.setdefault(ct["vmid"], []).append(
-                        {"cle": str(cible.get("cle") or shm_c), "shm": shm_c,
-                         "rouge": coul_r, "vert": coul_v, "texte": txt_c})
-                continue
-            params = dc.get("params") or {}
-            # Mode Direct : le multiview reçoit le TSL via son serveur local → ne pas double-piloter.
-            tsl_mode = params.get("tsl_mode") or (
-                "direct" if (int(params.get("tsl_port") or 0) > 0 and not params.get("tsl_remote"))
-                else "central")
-            if tsl_mode == "direct":
-                continue
-            flux_config = params.get("flux_config") or []
-            vmid = ct["vmid"]
-            for i, fc in enumerate(flux_config):
-                if not isinstance(fc, dict):
-                    continue
-                # NIVEAUX de cette tuile : une LISTE d'identifiants depuis le dénouement.
-                # Vide = « ceux de mon projet ». Le numéro de bande 1-based a disparu : il
-                # réintroduisait le « 3 » de TSL au cœur d'un réglage de multiview.
-                # ⚠ UNE CHAÎNE N'EST PAS UNE LISTE, et Python ne le dira pas : depuis que les
-                # niveaux sont des UUID, un scalaire hérité est une CHAÎNE, et `for n in ...`
-                # l'aurait parcourue caractère par caractère — trente-six « niveaux » d'une
-                # lettre, dont aucun n'existe, donc un tally qui ne s'allume jamais et pas la
-                # moindre erreur.
-                niveaux_fc = fc.get("tally_level") or []
-                if not isinstance(niveaux_fc, list):
-                    niveaux_fc = [niveaux_fc]
-                want_red   = bool(fc.get("tally_red"))
-                want_green = bool(fc.get("tally_green"))
-                want_text  = fc.get("label_source") == "protocol"
-                if not niveaux_fc:
-                    niveaux_fc = proj_niv.get(ct.get("project_id")) or []
-                if not niveaux_fc or not (want_red or want_green or want_text):
-                    continue
-                # Le porteur est celui qui POSSÈDE ces niveaux — plus une bande à recouper.
-                lvl_fc, conn = _porteur_pour(niveaux_fc)
-                if not conn:
-                    continue
-                # Index TSL déduit de la source du PiP (pas saisi à la main en central).
-                # flux_config[i] câble via "path" ("/dev/shm/<shm>"), jamais "shm" (cf. app/routes.py:750).
-                shm = (fc.get("path") or "").strip()
-                if shm.startswith("/dev/shm/"):
-                    shm = shm[len("/dev/shm/"):]
-                ckey = conn.get("_key", int(conn.get("id") or 0))
-                tsl_index = idx_by_conn_shm.get((ckey, shm))
-                if tsl_index is None:
-                    continue
-                label_col = int(fc.get("label_col") or 0)
-
-                # Le niveau a plusieurs états : `amber` allume les DEUX bandeaux de la tuile,
-                # c'est ainsi que l'orange se voit sur le mur.
-                _e = state.get((tsl_index, lvl_fc), "off")
-                color_l = "red"   if (want_red   and _e in ("red", "amber"))   else "off"
-                color_r = "green" if (want_green and _e in ("green", "amber")) else "off"
-                try:
-                    lref = label_ref.get((ckey, shm))
-                    text = db_get_source_label_for_shm(lref or shm, label_col)
-                    if not text and lref:
-                        text = db_get_source_label_for_shm(shm, label_col)
-                except Exception:
-                    text = ""
-
-                upd = updates_by_vmid.setdefault(vmid, [])
-                upd.append({"flux_idx": i, "slot": "L", "color": color_l, "text": text})
-                upd.append({"flux_idx": i, "slot": "R", "color": color_r, "text": text})
-
-            # Overlays texte « TSL/Tableau » : reliés à une LIGNE du tableau /labels (label_row)
-            # + une colonne (texte) + un niveau de Tally (allumage). Tout résolu côté orchestrateur.
-            for ov in (params.get("overlays") or []):
-                if not isinstance(ov, dict) or (ov.get("kind") or "") != "text":
-                    continue
-                if (ov.get("text_source") or "local") != "tsl":
-                    continue
-                row_shm = (ov.get("label_row") or "").strip()
-                if not row_shm:
-                    continue
-                try:
-                    o_text = db_get_source_label_for_shm(row_shm, int(ov.get("label_col") or 0))
-                except Exception:
-                    o_text = ""
-                active = False
-                o_niv = ov.get("tally_level") or []
-                if not isinstance(o_niv, list):
-                    o_niv = [o_niv]
-                if not o_niv:
-                    o_niv = proj_niv.get(ct.get("project_id")) or []
-                if o_niv and (ov.get("tally_red") or ov.get("tally_green")):
-                    lvl_o, o_conn = _porteur_pour(o_niv)
-                    if o_conn:
-                        row_res = resolve_ref(row_shm) or row_shm
-                        o_idx = idx_by_conn_shm.get(
-                            (o_conn.get("_key", int(o_conn.get("id") or 0)), row_res))
-                        if o_idx is not None:
-                            _eo = state.get((o_idx, lvl_o), "off")
-                            red_on   = bool(ov.get("tally_red"))   and _eo in ("red", "amber")
-                            green_on = bool(ov.get("tally_green")) and _eo in ("green", "amber")
-                            active = red_on or green_on
-                ovl = overlays_by_vmid.setdefault(vmid, [])
-                ovl.append({"id": ov.get("id"), "text": o_text, "active": active})
-
-        from app.metrics import get_container_ip
-        _now_p = time.time()
-        for vmid in set(updates_by_vmid) | set(overlays_by_vmid):
-            try:
-                ip = get_container_ip(vmid)
-                if not ip:
-                    continue
-                payload = {"updates": updates_by_vmid.get(vmid, []),
-                           "overlays": overlays_by_vmid.get(vmid, [])}
-                # ★ PERF : ne POSTER que si l'état a RÉELLEMENT changé. Ce distributeur tourne
-                # sur un timeout de 100 ms (il repasse même sans événement TSL) : re-pousser un
-                # paquet identique 10×/s faisait re-baker l'habillage PLEIN CADRE du multiview
-                # 10×/s (PIL + RGBA→YUV + upload GPU ≈ 25 ms, soit une trame perdue à chaque
-                # fois — mur 333 Horace mesuré à 28-36 fps au lieu de 50). Le mur a lui aussi
-                # sa garde (comparaison de valeur avant de marquer sale, multiview ≥ 0.39.2) ;
-                # celle-ci évite en plus 10 requêtes HTTP/s et par mur.
-                # Re-synchro périodique (5 s) : un mur redéployé repart avec un tally VIDE — sans
-                # ce filet, il resterait éteint jusqu'au prochain changement TSL. Coût nul côté
-                # mur grâce à sa garde de valeur (paquet identique = aucun re-bake).
-                _prev, _pts = _last_push.get(vmid, (None, 0.0))
-                if _prev == payload and (_now_p - _pts) < 5.0:
-                    continue
-                _req.post(f"http://{ip}:8080/tally_bulk", json=payload, timeout=1)
-                _last_push[vmid] = (payload, _now_p)
-            except Exception:
-                _last_push.pop(vmid, None)   # échec → re-pousser au prochain tour
 
 
 # ─── API publique ──────────────────────────────────────────────────────────────
 def start_all():
-    """Démarre le distributor + le publisher mixer + toutes les connexions activées."""
-    global _dist_thr, _mixer_pub_thr
-    stop_all()
-    _stop_evt.clear()
-    _tally_dirty.clear()
-    _dist_thr = threading.Thread(target=_distributor, daemon=True)
-    _dist_thr.start()
-    _mixer_pub_thr = threading.Thread(target=_mixer_publisher, daemon=True)
-    _mixer_pub_thr.start()
+    """Démarre les serveurs/clients TSL activés.
+
+    ⚠ LE MODÈLE D'ABORD. `app.tally.demarrer()` lance le distributeur ; un serveur TSL qui
+    recevrait une trame avant lui poserait un tally que personne ne distribue. L'ordre est
+    tenu ici plutôt que laissé à l'appelant — main.py n'a pas à connaître cette contrainte.
+
+    Le modèle est démarré même si aucune connexion TSL n'existe : IS-07 et le mélangeur
+    écrivent dans le même état, et ils n'ont pas à dépendre de la présence d'une connexion TSL."""
+    _tally.demarrer()
     reload()
 
+
 def stop_all():
-    global _dist_thr, _mixer_pub_thr
-    _stop_evt.set()
-    _tally_dirty.set()
-    with _lock:
+    """Arrête les connexions TSL. Le MODÈLE N'EST PAS ARRÊTÉ : ses deux fils servent aussi
+    IS-07 et le mélangeur. Les couper ici éteindrait tous les murs parce qu'on a désactivé
+    une connexion TSL — exactement le couplage que ce chantier retire."""
+    with _lock_conn:
         for srv in _connections.values():
             srv.stop()
         _connections.clear()
-    if _dist_thr and _dist_thr.is_alive():
-        _dist_thr.join(timeout=3)
-    _dist_thr = None
-    if _mixer_pub_thr and _mixer_pub_thr.is_alive():
-        _mixer_pub_thr.join(timeout=3)
-    _mixer_pub_thr = None
+    _publier_porteurs()
 
 def reload():
     """Synchronise _connections depuis la DB (crée/met à jour/supprime)."""
@@ -1139,7 +599,7 @@ def reload():
         log.warning(f"TSL reload: impossible de lire les connexions ({e})")
         return
 
-    with _lock:
+    with _lock_conn:
         wanted_ids = {r["id"] for r in rows if r["enabled"]}
         current_ids = set(_connections.keys())
 
@@ -1183,79 +643,81 @@ def reload():
                 _connections[cid] = srv2
                 srv2.start()
 
-def _cumul_des_sources(cle):
-    """Couleur résultante d'une case, tous écrivains confondus. À appeler SOUS `_lock`."""
-    couleur = "off"
-    for c in (_tally_par_source.get(cle) or {}).values():
-        couleur = cumuler(couleur, c)
-    return couleur
+    _publier_porteurs()
 
 
-def _poser_cases(source, cases):
-    """Pose/actualise les cases nommées pour cette source, sans toucher aux autres. Sous `_lock`
-    en interne ; renvoie True si le CUMUL a bougé quelque part."""
-    change = False
-    with _lock:
-        for cle, couleur in (cases or {}).items():
-            par = _tally_par_source.setdefault(cle, {})
-            if couleur == "off":
-                if par.pop(source, None) is None:
+def _index_de_connexion(cid):
+    """Fabrique le `index_de` d'une connexion TSL : shm → index déclaré dans SON mapping.
+
+    ⚠ Une FERMETURE qui relit le mapping à chaque appel, et non une table capturée : un
+    exploitant ajoute une correspondance sans redémarrer, et un index figé au démarrage
+    l'ignorerait jusqu'au prochain `reload()` — un PiP qui reste éteint sans rien à voir
+    dans les journaux."""
+    def index_de(shm, _niveau=None):
+        if not shm:
+            return None
+        try:
+            from app.database import db_get_tsl_mappings_all
+            cible = resolve_ref(shm) or shm
+            for m in db_get_tsl_mappings_all():
+                if int(m.get("connection_id") or 0) != int(cid):
                     continue
-            elif par.get(source) == couleur:
-                continue
-            else:
-                par[source] = couleur
-            neuf = _cumul_des_sources(cle)
-            if not par:
-                _tally_par_source.pop(cle, None)
-            if _tally_state.get(cle, "off") != neuf:
-                if neuf == "off":
-                    _tally_state.pop(cle, None)
-                else:
-                    _tally_state[cle] = neuf
-                change = True
-    return change
+                ref = (m.get("source_shm") or "").strip()
+                if ref and (resolve_ref(ref) or ref) == cible:
+                    return int(m.get("tsl_index") or 0)
+        except Exception:
+            return None
+        return None
+    return index_de
 
 
-def poser_tally(source, cases, reveiller=True):
-    """Remplace la contribution ENTIÈRE de `source`. Renvoie True si le cumul a bougé.
+def _ref_de_connexion(cid):
+    """Fabrique le `ref_de` d'une connexion : shm → la référence telle qu'elle est ÉCRITE dans
+    le mapping, quand elle diffère du shm résolu.
 
-    ★ ENTIÈRE, ET C'EST LE POINT. Un écrivain qui ne poserait que ses cases allumées ne pourrait
-    jamais en éteindre une : la source qui sort du programme garderait son rouge indéfiniment,
-    faute d'un « off » explicite. On retire donc d'abord tout ce que cette source affirmait et
-    qu'elle n'affirme plus — sans toucher à ce que les AUTRES affirment sur les mêmes cases.
-
-    `source` est une chaîne qui identifie l'écrivain : `tsl:<id>`, `mixer:<vmid>`,
-    `is07:<receiver>`. Deux écrivains sur le même niveau se CUMULENT (rouge + vert = ambre) au
-    lieu de s'écraser."""
-    cases = {k: v for k, v in (cases or {}).items() if v and v != "off"}
-    change = False
-    with _lock:
-        # ⚠ CE FILTRE EST UNE OPTIMISATION, PAS LE GARDE-FOU. Ce qui protège les autres écrivains,
-        # c'est le `par.pop(source)` de `_poser_cases` : retirer sa propre entrée d'une case ne
-        # touche à rien d'autre. Vérifié par mutation — élargir cette liste à toutes les cases ne
-        # change aucun résultat. Ne pas la « corriger » en croyant renforcer quelque chose.
-        anciennes = [cle for cle, par in _tally_par_source.items() if source in par]
-    a_retirer = {cle: "off" for cle in anciennes if cle not in cases}
-    if a_retirer:
-        change = _poser_cases(source, a_retirer) or change
-    change = _poser_cases(source, cases) or change
-    if change and reveiller:
-        _tally_dirty.set()
-    return change
+    Un mapping peut viser `port:<id>` ; le libellé, lui, a été écrit sous cette référence-là.
+    Chercher le texte sous le shm résolu le ferait disparaître, sans erreur."""
+    def ref_de(shm):
+        if not shm:
+            return None
+        try:
+            from app.database import db_get_tsl_mappings_all
+            cible = resolve_ref(shm) or shm
+            for m in db_get_tsl_mappings_all():
+                if int(m.get("connection_id") or 0) != int(cid):
+                    continue
+                ref = (m.get("source_shm") or "").strip()
+                if ref and (resolve_ref(ref) or ref) == cible and ref != cible:
+                    return ref
+        except Exception:
+            return None
+        return None
+    return ref_de
 
 
-def sources_du_tally() -> dict:
-    """`{"<index>_<niveau>": {source: couleur}}` — QUI affirme quoi. Sert au diagnostic : sans
-    ça, un niveau servi par deux écrivains ne dit pas lequel allume la lampe."""
-    with _lock:
-        return {f"{idx}_{lvl}": dict(par)
-                for (idx, lvl), par in _tally_par_source.items() if par}
+def _publier_porteurs():
+    """Déclare au MODÈLE les niveaux que ce protocole porte, et retire ceux qu'il ne porte plus.
 
+    ★ C'EST L'INVERSION DE DÉPENDANCE. Le distributeur allait chercher ses porteurs dans
+    `db_get_tsl_connections()` : le modèle lisait donc la table d'un protocole, et il aurait
+    fallu lui apprendre `is07_connections`, puis celle du suivant. Désormais chaque protocole
+    se DÉCLARE, et `app/tally.py` ne connaît aucune table de protocole.
 
-def get_tally_state() -> dict:
-    with _lock:
-        return {f"{idx}_{lvl}": color for (idx, lvl), color in _tally_state.items()}
+    Seules les connexions ENTRANTES sont des porteurs : une sortante consomme l'état, elle ne
+    le sert pas — l'inscrire ferait croire au distributeur que quelqu'un écrit ce niveau."""
+    vivants = set()
+    with _lock_conn:
+        entrantes = [(cid, srv) for cid, srv in _connections.items()
+                     if isinstance(srv, _TslServer) and srv.niveau]
+    for cid, srv in entrantes:
+        cle = "tsl:%s" % cid
+        vivants.add(cle)
+        enregistrer_porteur(cle, [srv.niveau], _index_de_connexion(cid),
+                            nom="TSL #%s" % cid, ref_de=_ref_de_connexion(cid))
+    # Ne retirer QUE nos porteurs : ceux d'un autre protocole ne nous appartiennent pas.
+    for cle in [c for c in liste_porteurs() if c.startswith("tsl:")]:
+        if cle not in vivants:
+            retirer_porteur(cle)
 
 
 # ─── Actions de service (chantier 6 — macros/shotbox) ─────────────────────────
@@ -1301,40 +763,6 @@ def _ref_options(pid=None):
     except Exception:
         pass
     return out
-
-
-NOMS_COLONNES_DEFAUT = ["Hostname", "MXL", "Label 2", "Label 3", "Label 4",
-                        "Label 5", "Label 6", "Label 7", "Label 8", "Label 9"]
-
-
-def noms_colonnes():
-    """Les DIX noms de colonnes, toujours — y compris ceux des colonnes masquées."""
-    from app.database import db_get_setting
-    noms = db_get_setting("tsl_label_names", None)
-    if isinstance(noms, str):
-        try:
-            noms = json.loads(noms)
-        except Exception:
-            noms = None
-    if not isinstance(noms, list):
-        noms = []
-    return [str(noms[i]) if i < len(noms) and noms[i] else NOMS_COLONNES_DEFAUT[i]
-            for i in range(10)]
-
-
-def nb_colonnes_actives():
-    """Combien de colonnes PERSONNALISÉES sont offertes (1 à 8). Deux par défaut.
-
-    ⚠ LE DÉFAUT NE S'APPLIQUE QU'AUX INSTALLATIONS NEUVES. `_migrer_colonnes_libelles` pose la
-    valeur initiale au premier démarrage d'après ce qui EXISTE — une colonne renommée ou
-    remplie compte — sinon un site qui se sert de six colonnes en verrait quatre disparaître de
-    ses tableaux, sans un mot, pour un défaut qui ne le concernait pas."""
-    from app.database import db_get_setting
-    try:
-        n = int(db_get_setting("label_cols_actives", 2))
-    except (TypeError, ValueError):
-        n = 2
-    return max(1, min(8, n))
 
 
 def action_options(action_id, key, pid=None):
@@ -1412,12 +840,8 @@ def run_action(action_id, params, ctx):
     _tally_dirty.set()   # les multiviews re-résolvent leurs labels
     return True
 
-def get_tally_level(tsl_index: int, level: int) -> str:
-    with _lock:
-        return _tally_state.get((tsl_index, level), "off")
-
 def connections_status() -> list:
-    with _lock:
+    with _lock_conn:
         return [srv.status_dict() for srv in _connections.values()]
 
 
@@ -1429,7 +853,7 @@ def stop():
     stop_all()
 
 def is_running():
-    with _lock:
+    with _lock_conn:
         return any(srv.running for srv in _connections.values())
 
 def status_dict() -> dict:
@@ -1455,7 +879,7 @@ def status_dict() -> dict:
         actives = [r["port"] for r in lignes if r["enabled"]]
     except Exception:
         n_tot, actives = 0, []
-    with _lock:
+    with _lock_conn:
         running = any(s.running for s in _connections.values())
         clients = sum(s.clients for s in _connections.values())
         last_pkts = [s.last_pkt for s in _connections.values() if s.last_pkt]
@@ -1480,15 +904,16 @@ def status_dict() -> dict:
 def register_routes(bp):
     from flask import request, jsonify
     from app.auth import require_login, require_perm
-    from app.database import (db_get_setting, db_set_setting,
-                               db_get_tsl_connections, db_upsert_tsl_connection,
-                               db_delete_tsl_connection,
-                               db_get_source_labels, db_upsert_source_label,
-                               db_delete_source_label, db_get_source_labels_by_shm,
-                               db_get_tsl_mapping, db_upsert_tsl_mapping,
-                               db_delete_tsl_mapping, db_get_tsl_mappings_all,
-                               db_set_tsl_mapping_for_source,
-                               db_get_tsl_sources_by_shm)
+    # Les fonctions de LIBELLÉS sont parties avec leurs routes (app/routes/labels_api.py).
+    from app.database import (db_get_setting,
+                              db_get_tsl_connections,
+                              db_upsert_tsl_connection,
+                              db_delete_tsl_connection,
+                              db_get_tsl_mapping,
+                              db_upsert_tsl_mapping,
+                              db_delete_tsl_mapping,
+                              db_get_tsl_mappings_all,
+                              db_set_tsl_mapping_for_source)
 
     # ── Connexions ────────────────────────────────────────────────────────────
 
@@ -1525,143 +950,7 @@ def register_routes(bp):
         reload()
         return jsonify({"ok": True})
 
-    # ── Source labels ─────────────────────────────────────────────────────────
-
-    @bp.route("/api/source_labels", methods=["GET"])
-    @require_login
-    def source_labels_get():
-        return jsonify(db_get_source_labels())
-
-    @bp.route("/api/source_labels/batch", methods=["POST"])
-    @require_perm("settings.edit")
-    def source_labels_batch():
-        rows = request.json or []
-        if not isinstance(rows, list):
-            return jsonify({"error": "liste attendue"}), 400
-        saved = 0
-        for row in rows:
-            shm = (row.get("shm") or "").strip()
-            if not shm:
-                continue
-            fields = {k: v for k, v in row.items() if k != "shm"}
-            db_upsert_source_label(shm, fields)
-            saved += 1
-        return jsonify({"ok": True, "saved": saved})
-
-    @bp.route("/api/source_labels/<path:shm>", methods=["DELETE"])
-    @require_perm("settings.edit")
-    def source_label_delete(shm):
-        db_delete_source_label(shm)
-        return jsonify({"ok": True})
-
-    @bp.route("/api/tsl/sources/by_shm", methods=["GET"])
-    @require_login
-    def tsl_sources_by_shm():
-        return jsonify(db_get_source_labels_by_shm())
-
     # ── Suffix map (héritage parent → label auto) ─────────────────────────────
-
-    _DEFAULT_SUFFIX_MAP = {"_audio_0": "_A1", "_audio_1": "_A2", "_anc_0": "_Anc"}
-
-    @bp.route("/api/source_labels/orphelins", methods=["GET"])
-    @require_login
-    def source_labels_orphelins():
-        """Les lignes de libellé dont PLUS AUCUN conteneur ne produit le flux.
-
-        ★ « ABSENT » VEUT DIRE ABSENT DE LA DÉCLARATION, PAS ÉTEINT. `/api/sources` dérive de
-        `deploy_config` : un conteneur arrêté, un nœud injoignable, un flux qui ne coule pas —
-        tout cela reste DÉCLARÉ. Ne sont orphelines que les lignes dont le producteur a été
-        détruit ou renommé. Sans cette propriété, arrêter un conteneur ferait basculer tous ses
-        libellés en « à nettoyer », et quelqu'un les supprimerait.
-
-        ⚠ ON NE SUPPRIME RIEN ICI. Un libellé est du TRAVAIL — quelqu'un l'a écrit — et une ligne
-        vide ne coûte qu'une ligne. On les CLASSE pour que l'exploitant tranche :
-          · `rempli`  : au moins un libellé écrit. Le perdre, c'est perdre ce travail.
-          · `mappe`   : une correspondance TSL ou IS-07 la vise encore. La retirer casserait le
-                        tally de quelque chose que quelqu'un adresse — même si le flux a disparu,
-                        c'est le signe qu'on n'a pas fini de ranger."""
-        from app.database import (db_get_source_labels, db_get_tsl_mappings_all,
-                                  db_get_is07_mappings_all, db_get_containers)
-        from app import plugins as _plg
-        import json as _json
-        declares = set()
-        for c in db_get_containers():
-            try:
-                dc = c.get("deploy_config")
-                dc = _json.loads(dc) if isinstance(dc, str) else (dc or {})
-                if not dc:
-                    continue
-                w = _plg.derive_wiring(dc.get("type"), c.get("hostname"),
-                                       dc.get("params") or {}) or {}
-                for prod in (w.get("produces") or []):
-                    if prod.get("shm"):
-                        declares.add(prod["shm"])
-            except Exception:
-                continue
-        vises = set()
-        for m in (db_get_tsl_mappings_all() or []):
-            if m.get("source_shm"):
-                vises.add(m["source_shm"])
-        try:
-            for m in (db_get_is07_mappings_all() or []):
-                if m.get("source_shm"):
-                    vises.add(m["source_shm"])
-        except Exception:
-            pass
-        out = []
-        for l in db_get_source_labels():
-            shm = l.get("shm") or ""
-            # Les lignes de TEXTE (`__umd:`) n'ont pas de producteur par construction : les
-            # compter orphelines les proposerait au nettoyage à chaque passage.
-            if not shm or shm.startswith("__umd:") or shm in declares:
-                continue
-            out.append({"shm": shm,
-                        "rempli": [k for k in l if k.startswith("label_") and l[k]],
-                        "mappe": shm in vises})
-        return jsonify(sorted(out, key=lambda x: x["shm"]))
-
-    @bp.route("/api/source_labels/orphelins", methods=["POST"])
-    @require_perm("settings.edit")
-    def source_labels_orphelins_purge():
-        """`{"shms": [...]}` — retire ces lignes de libellé. Refuse celles qu'une correspondance
-        vise encore : le tally les adresse, et les effacer serait casser en silence."""
-        from app.database import (db_delete_source_label, db_get_tsl_mappings_all,
-                                  db_get_is07_mappings_all)
-        d = request.json or {}
-        shms = d.get("shms")
-        if not isinstance(shms, list):
-            return jsonify({"error": "`shms` : liste attendue"}), 400
-        vises = {m.get("source_shm") for m in (db_get_tsl_mappings_all() or [])}
-        try:
-            vises |= {m.get("source_shm") for m in (db_get_is07_mappings_all() or [])}
-        except Exception:
-            pass
-        retires, refuses = 0, []
-        for shm in shms:
-            shm = str(shm or "").strip()
-            if not shm:
-                continue
-            if shm in vises:
-                refuses.append(shm)
-                continue
-            db_delete_source_label(shm)
-            retires += 1
-        return jsonify({"ok": True, "retires": retires, "refuses": refuses})
-
-    @bp.route("/api/source_labels/suffix_map", methods=["GET"])
-    @require_login
-    def source_labels_suffix_map_get():
-        stored = db_get_setting("source_label_suffix_map", None)
-        return jsonify(stored if isinstance(stored, dict) else _DEFAULT_SUFFIX_MAP)
-
-    @bp.route("/api/source_labels/suffix_map", methods=["POST"])
-    @require_perm("settings.edit")
-    def source_labels_suffix_map_set():
-        data = request.json
-        if not isinstance(data, dict):
-            return jsonify({"error": "dict attendu"}), 400
-        db_set_setting("source_label_suffix_map", {str(k): str(v) for k, v in data.items()})
-        return jsonify({"ok": True})
 
     # ── Mapping par connexion ─────────────────────────────────────────────────
 
@@ -1702,12 +991,14 @@ def register_routes(bp):
         data = request.json or {}
         source_shm = (data.get("source_shm") or "").strip()
         db_upsert_tsl_mapping(cid, idx, source_shm)
+        _invalider_mapping(cid)
         return jsonify({"ok": True})
 
     @bp.route("/api/tsl/mapping/<int:cid>/<int:idx>", methods=["DELETE"])
     @require_perm("settings.edit")
     def tsl_mapping_delete(cid, idx):
         db_delete_tsl_mapping(cid, idx)
+        _invalider_mapping(cid)
         return jsonify({"ok": True})
 
     # ── Mapping vu par-source (éditeur de labels, colonnes par connexion) ──────
@@ -1733,67 +1024,8 @@ def register_routes(bp):
                 idx = idx.strip() or None
             db_set_tsl_mapping_for_source(int(row["connection_id"]), shm, idx)
             saved += 1
+        _invalider_mapping()
         return jsonify({"ok": True, "saved": saved})
-
-    # ── Noms des colonnes ──────────────────────────────────────────────────────
-
-    @bp.route("/api/tsl/label_names", methods=["GET"])
-    @require_login
-    def tsl_label_names_get():
-        """Les colonnes de libellé OFFERTES : hostname, MXL, puis les personnalisées actives.
-
-        ★ ON EN REND MOINS QU'IL N'EN EXISTE, et c'est le point. Huit colonnes personnalisées
-        étaient proposées d'office ; un site en utilise deux ou trois, et les cinq autres
-        allongeaient chaque menu, chaque tableau et chaque sélecteur du produit sans rien porter.
-        Le nombre actif est un réglage (`label_cols_actives`, 2 par défaut) et les colonnes
-        s'ajoutent au besoin.
-
-        ⚠ LES HUIT COLONNES PHYSIQUES RESTENT. Réduire l'affichage n'efface aucune donnée : un
-        libellé écrit en colonne 7 reste lisible par son index (`db_get_source_label_for_shm`),
-        et réaugmenter le nombre le fait réapparaître intact. C'est ce qui rend le réglage
-        réversible sans risque."""
-        return jsonify(noms_colonnes()[:2 + nb_colonnes_actives()])
-
-    @bp.route("/api/tsl/label_names", methods=["POST"])
-    @require_perm("settings.edit")
-    def tsl_label_names_set():
-        data = request.json
-        if not isinstance(data, list) or not (3 <= len(data) <= 10):
-            return jsonify({"error": "liste de 3 à 10 noms attendue"}), 400
-        # On COMPLÈTE jusqu'à dix avec les noms déjà en base : enregistrer une liste tronquée
-        # écraserait le nom des colonnes masquées, qu'on retrouverait anonymes en les rouvrant.
-        anciens = noms_colonnes()
-        noms = [str(n) for n in data] + anciens[len(data):]
-        db_set_setting("tsl_label_names", noms[:10])
-        return jsonify({"ok": True})
-
-    @bp.route("/api/tsl/label_cols", methods=["GET"])
-    @require_login
-    def tsl_label_cols_get():
-        return jsonify({"actives": nb_colonnes_actives(), "max": 8,
-                        "noms": noms_colonnes()})
-
-    @bp.route("/api/tsl/label_cols", methods=["POST"])
-    @require_perm("settings.edit")
-    def tsl_label_cols_set():
-        """`{"actives": n}` — combien de colonnes personnalisées sont offertes (1 à 8)."""
-        d = request.json or {}
-        try:
-            n = int(d.get("actives"))
-        except (TypeError, ValueError):
-            return jsonify({"error": "`actives` : entier attendu"}), 400
-        if not (1 <= n <= 8):
-            return jsonify({"error": "entre 1 et 8"}), 400
-        db_set_setting("label_cols_actives", n)
-        return jsonify({"ok": True, "actives": n})
-
-
-    # ── État tally ────────────────────────────────────────────────────────────
-
-    @bp.route("/api/tsl/state", methods=["GET"])
-    @require_login
-    def tsl_state():
-        return jsonify(get_tally_state())
 
     # ── Compat : anciens endpoints ────────────────────────────────────────────
 
@@ -1826,3 +1058,23 @@ def register_routes(bp):
         reload()
         return jsonify(status_dict())
 
+    # ─── Compatibilité : les adresses de LIBELLÉS ont quitté ce service ─────────────────
+    # ★ ELLES N'AVAIENT RIEN DE PROTOCOLAIRE. `/api/tsl/label_names`, `/api/tsl/label_cols`,
+    # `/api/tsl/sources/by_shm` et `/api/tsl/state` servaient les libellés d'une source et
+    # l'état CUMULÉ du tally — que celui-ci vienne de TSL, d'IS-07 ou d'un mélangeur. Elles
+    # vivent désormais sous `/api/labels/*` et `/api/tally/state`.
+    #
+    # ⚠ 308 ET NON 301 : un 301 autorise le client à retomber en GET, et un POST de libellés
+    # y perdrait son corps — donc l'écriture, sans la moindre erreur visible.
+    for _i, (_vieux, _neuf) in enumerate([
+            ("/api/tsl/label_names",    "/api/labels/names"),
+            ("/api/tsl/label_cols",     "/api/labels/cols"),
+            ("/api/tsl/sources/by_shm", "/api/labels/by_shm"),
+            ("/api/tsl/state",          "/api/tally/state")]):
+        def _mk(neuf=_neuf):
+            def _redir(**kw):
+                from flask import redirect
+                return redirect(neuf, code=308)
+            return _redir
+        bp.add_url_rule(_vieux, endpoint="tsl_compat_%d" % _i, view_func=_mk(),
+                        methods=["GET", "POST"])

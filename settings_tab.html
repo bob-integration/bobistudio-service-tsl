@@ -87,9 +87,9 @@ async function rafraichirTsl() {
         if (!_tslProjects.length) await _tslLoadProjects();
         const [rc, rl, rs, rstate, rmap] = await Promise.all([
             fetch('/api/tsl/connections'),
-            fetch('/api/tsl/label_names'),
-            fetch('/api/tsl/sources'),
-            fetch('/api/tsl/state'),
+            fetch('/api/labels/names'),
+            fetch('/api/labels'),   // ⚠ était '/api/tsl/sources' — route INEXISTANTE, donc 404
+            fetch('/api/tally/state'),
             fetch('/api/tsl/mapping_all'),
         ]);
         if (rc.ok)     _tslConns      = await rc.json();
@@ -444,7 +444,7 @@ async function _tslLivePoll() {
     try {
         const [rc, rstate] = await Promise.all([
             fetch('/api/tsl/connections'),
-            fetch('/api/tsl/state'),
+            fetch('/api/tally/state'),
         ]);
         if (rc.ok)     _tslConns = await rc.json();
         await tslNiveauxLoad();
