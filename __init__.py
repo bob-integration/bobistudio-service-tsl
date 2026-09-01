@@ -1558,6 +1558,91 @@ def register_routes(bp):
 
     _DEFAULT_SUFFIX_MAP = {"_audio_0": "_A1", "_audio_1": "_A2", "_anc_0": "_Anc"}
 
+    @bp.route("/api/source_labels/orphelins", methods=["GET"])
+    @require_login
+    def source_labels_orphelins():
+        """Les lignes de libellé dont PLUS AUCUN conteneur ne produit le flux.
+
+        ★ « ABSENT » VEUT DIRE ABSENT DE LA DÉCLARATION, PAS ÉTEINT. `/api/sources` dérive de
+        `deploy_config` : un conteneur arrêté, un nœud injoignable, un flux qui ne coule pas —
+        tout cela reste DÉCLARÉ. Ne sont orphelines que les lignes dont le producteur a été
+        détruit ou renommé. Sans cette propriété, arrêter un conteneur ferait basculer tous ses
+        libellés en « à nettoyer », et quelqu'un les supprimerait.
+
+        ⚠ ON NE SUPPRIME RIEN ICI. Un libellé est du TRAVAIL — quelqu'un l'a écrit — et une ligne
+        vide ne coûte qu'une ligne. On les CLASSE pour que l'exploitant tranche :
+          · `rempli`  : au moins un libellé écrit. Le perdre, c'est perdre ce travail.
+          · `mappe`   : une correspondance TSL ou IS-07 la vise encore. La retirer casserait le
+                        tally de quelque chose que quelqu'un adresse — même si le flux a disparu,
+                        c'est le signe qu'on n'a pas fini de ranger."""
+        from app.database import (db_get_source_labels, db_get_tsl_mappings_all,
+                                  db_get_is07_mappings_all, db_get_containers)
+        from app import plugins as _plg
+        import json as _json
+        declares = set()
+        for c in db_get_containers():
+            try:
+                dc = c.get("deploy_config")
+                dc = _json.loads(dc) if isinstance(dc, str) else (dc or {})
+                if not dc:
+                    continue
+                w = _plg.derive_wiring(dc.get("type"), c.get("hostname"),
+                                       dc.get("params") or {}) or {}
+                for prod in (w.get("produces") or []):
+                    if prod.get("shm"):
+                        declares.add(prod["shm"])
+            except Exception:
+                continue
+        vises = set()
+        for m in (db_get_tsl_mappings_all() or []):
+            if m.get("source_shm"):
+                vises.add(m["source_shm"])
+        try:
+            for m in (db_get_is07_mappings_all() or []):
+                if m.get("source_shm"):
+                    vises.add(m["source_shm"])
+        except Exception:
+            pass
+        out = []
+        for l in db_get_source_labels():
+            shm = l.get("shm") or ""
+            # Les lignes de TEXTE (`__umd:`) n'ont pas de producteur par construction : les
+            # compter orphelines les proposerait au nettoyage à chaque passage.
+            if not shm or shm.startswith("__umd:") or shm in declares:
+                continue
+            out.append({"shm": shm,
+                        "rempli": [k for k in l if k.startswith("label_") and l[k]],
+                        "mappe": shm in vises})
+        return jsonify(sorted(out, key=lambda x: x["shm"]))
+
+    @bp.route("/api/source_labels/orphelins", methods=["POST"])
+    @require_perm("settings.edit")
+    def source_labels_orphelins_purge():
+        """`{"shms": [...]}` — retire ces lignes de libellé. Refuse celles qu'une correspondance
+        vise encore : le tally les adresse, et les effacer serait casser en silence."""
+        from app.database import (db_delete_source_label, db_get_tsl_mappings_all,
+                                  db_get_is07_mappings_all)
+        d = request.json or {}
+        shms = d.get("shms")
+        if not isinstance(shms, list):
+            return jsonify({"error": "`shms` : liste attendue"}), 400
+        vises = {m.get("source_shm") for m in (db_get_tsl_mappings_all() or [])}
+        try:
+            vises |= {m.get("source_shm") for m in (db_get_is07_mappings_all() or [])}
+        except Exception:
+            pass
+        retires, refuses = 0, []
+        for shm in shms:
+            shm = str(shm or "").strip()
+            if not shm:
+                continue
+            if shm in vises:
+                refuses.append(shm)
+                continue
+            db_delete_source_label(shm)
+            retires += 1
+        return jsonify({"ok": True, "retires": retires, "refuses": refuses})
+
     @bp.route("/api/source_labels/suffix_map", methods=["GET"])
     @require_login
     def source_labels_suffix_map_get():
