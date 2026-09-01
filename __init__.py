@@ -315,6 +315,7 @@ class _TslServer:
                 shm = db_get_source_for_tsl(self.conn_id, index)
                 if shm:
                     db_upsert_source_label(shm, {f"label_{self.label_col}": text})
+                    _tally.invalider_libelles()
             except Exception:
                 pass
 
@@ -803,6 +804,7 @@ def run_action(action_id, params, ctx):
             raise RuntimeError(f"« {ref} » n'appartient pas au projet (ports/sorties du projet seulement)")
     from app.database import db_upsert_source_label
     db_upsert_source_label(ref, {f"label_{col}": text})
+    _tally.invalider_libelles()
     signaler_changement()   # les multiviews re-résolvent leurs libellés
     return True
 
