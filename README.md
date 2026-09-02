@@ -2,6 +2,11 @@
 
 *[English version](README.en.md)*
 
+> ⚠ **Exige Bobi.Studio 0.9.2 ou plus récent.** Le modèle de tally vit désormais dans le cœur
+> (`app.tally`), ce service n'en portant plus que le protocole. Sur une version antérieure, ce
+> module n'existe pas : le service **ne démarre pas**, et l'erreur est un ImportError au
+> chargement.
+
 Implémentation **TSL 5.0** (tally et UMD) pour [Bobi.Studio](https://github.com/bob-integration/bobistudio).
 Reçoit le tally d'un contrôleur broadcast, le distribue aux fenêtres des multiviews, et écrit
 les libellés de source.
