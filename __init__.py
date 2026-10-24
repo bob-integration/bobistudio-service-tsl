@@ -313,6 +313,11 @@ class _TslServer:
             try:
                 from app.database import db_get_source_for_tsl, db_upsert_source_label
                 shm = db_get_source_for_tsl(self.conn_id, index)
+                # Port de projet : le nom reçu n'écrit dans la ligne du port que si le port
+                # l'accepte (`tsl_in = external`) — par défaut, le nom donné dans le projet reste.
+                _port = _tally._port_of(shm) if shm else None
+                if _port and (_port.get("tsl_in") or "port") != "external":
+                    shm = None
                 if shm:
                     db_upsert_source_label(shm, {f"label_{self.label_col}": text})
                     _tally.invalider_libelles()
