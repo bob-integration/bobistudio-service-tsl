@@ -1,6 +1,7 @@
 {
   "id": "tsl",
   "label": "TSL",
+  "help": {"category": "control"},
   "nav_tab": "protocoles",
   "tab_group": "protocoles",
   "tab_order": 2,
